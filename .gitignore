@@ -1,0 +1,53 @@
+# Dependencies
+# Ignore Node.js dependencies
+node_modules/
+
+# Ignore Python dependencies/virtual environments
+.venv/
+env/
+venv/
+.python-version
+
+
+
+node_modules
+.env
+dist
+coverage
+
+# Ignore Go build cache
+pkg/
+
+# Build artifacts and temporary files
+/build/
+/dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+test-*.js.map
+*.pyc
+
+# IDE and editor files
+.idea/ # IntelliJ, WebStorm, etc.
+.vscode/ # VS Code settings, but consider sharing launch configs
+*.suo
+*.user
+*.cas
+*.sak
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Sensitive credentials and environment variables
+# CRITICAL: Do not commit sensitive data
+.env
+.env.local
+config/*.env
+config/*.json # Be cautious with configuration files that contain secrets
+
+# Misc
+upload/ # If user uploads are stored locally
+temp/
+
