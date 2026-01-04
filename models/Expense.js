@@ -12,6 +12,7 @@ const ExpenseSchema = new mongoose.Schema({
   },
   amount: { type: Number, required: true },
   description: { type: String }, // e.g., "Lunch with Client X"
+  receiptUrls: [{ type: String }],
   
   status: { 
     type: String, 

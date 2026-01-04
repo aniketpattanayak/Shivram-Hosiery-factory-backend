@@ -1,40 +1,64 @@
 const Expense = require('../models/Expense');
 
-// @desc    Log New Expense(s) - Supports Single or Batch
+// @desc    Log New Expense(s) - Supports Single or Batch with AWS S3 Receipt
+// @route   POST /api/sales/expenses
+// @desc    Log New Expense(s) with Receipt Upload support
+// @route   POST /api/sales/expenses
+// @desc    Log New Expense(s) with Receipt Upload support
+// @route   POST /api/sales/expenses
+// @desc    Log New Expense(s) with Optional Multi-Receipt Upload support
 // @route   POST /api/sales/expenses
 exports.createExpense = async (req, res) => {
   try {
-    const body = req.body;
-    
-    // 1. Normalize Data: Ensure we are working with an Array
-    // If frontend sends { ... }, make it [{ ... }]
-    // If frontend sends [{ ... }, { ... }], keep it as is.
-    const items = Array.isArray(body) ? body : [body];
-
-    if (items.length === 0) {
-        return res.status(400).json({ msg: "No expense data provided" });
+    // 1. Safety check for req.body
+    if (!req.body) {
+        return res.status(400).json({ msg: "Backend received an empty request body. Check Multer setup." });
     }
 
-    // 2. Get Starting Count for ID Generation
+    let items;
+    // 2. Handle the stringified 'body' from FormData (Next.js sends this as a string)
+    if (req.body.body) {
+        try {
+            items = JSON.parse(req.body.body);
+        } catch (e) {
+            return res.status(400).json({ msg: "Invalid JSON format in expense body." });
+        }
+    } else {
+        // Fallback for standard JSON (non-image) requests
+        items = Array.isArray(req.body) ? req.body : [req.body];
+    }
+
+    // 🟢 ARCHITECT FIX: Support Multiple Optional Uploads
+    // Extract all S3 URLs from req.files (plural). If none, defaults to empty array [].
+    const receiptUrls = req.files ? req.files.map(file => file.location) : [];
+
+    // 3. Check if we actually have items to save
+    if (!items || items.length === 0 || (items.length === 1 && !items[0].amount)) {
+        return res.status(400).json({ msg: "No valid expense data found." });
+    }
+
+    // 4. Get Starting Count for ID Generation
     let currentCount = await Expense.countDocuments();
 
-    // 3. Prepare Batch Data with IDs
+    // 5. Map items to Schema with Sequential IDs and Cloud Links
     const expensesToSave = items.map(item => {
-        currentCount++; // Increment for unique IDs
+        currentCount++; 
         const expenseId = `EXP-${String(currentCount).padStart(4, '0')}`;
         
         return {
             expenseId,
-            salesPerson: item.salesPerson,
-            date: item.date,
-            category: item.category,
-            amount: Number(item.amount),
-            description: item.description,
-            status: 'Pending' // Default
+            salesPerson: item.salesPerson || "Unknown",
+            date: item.date || new Date(),
+            category: item.category || "Other",
+            amount: Number(item.amount) || 0,
+            description: item.description || "",
+            // 🟢 ARCHITECT FIX: Save the array of links (works even if empty)
+            receiptUrls: receiptUrls, 
+            status: 'Pending'
         };
     });
 
-    // 4. Bulk Insert (One DB Call)
+    // 6. Bulk Insert
     const result = await Expense.insertMany(expensesToSave);
 
     res.status(201).json({ 
@@ -44,12 +68,13 @@ exports.createExpense = async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Expense Error:", error);
-    res.status(500).json({ msg: error.message });
+    console.error("CRITICAL EXPENSE ERROR:", error);
+    res.status(500).json({ msg: "Failed to process expense: " + error.message });
   }
 };
 
-// ... (Keep getExpenses and updateExpenseStatus exactly as they were) ...
+// @desc    Get All Expenses
+// @route   GET /api/sales/expenses
 exports.getExpenses = async (req, res) => {
   try {
     const expenses = await Expense.find().sort({ createdAt: -1 });
@@ -59,6 +84,8 @@ exports.getExpenses = async (req, res) => {
   }
 };
 
+// @desc    Update Expense Status (Approve/Reject)
+// @route   PUT /api/sales/expenses/:id/status
 exports.updateExpenseStatus = async (req, res) => {
   try {
     const { status, reason } = req.body;
@@ -66,7 +93,9 @@ exports.updateExpenseStatus = async (req, res) => {
     if (!expense) return res.status(404).json({ msg: "Expense not found" });
 
     expense.status = status;
-    if (status === 'Rejected') expense.rejectionReason = reason || 'No reason provided';
+    if (status === 'Rejected') {
+        expense.rejectionReason = reason || 'No reason provided';
+    }
     
     await expense.save();
     res.json(expense);
