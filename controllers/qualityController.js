@@ -1,5 +1,6 @@
 const JobCard = require('../models/JobCard');
 const Product = require('../models/Product');
+const PurchaseOrder = require('../models/PurchaseOrder');
 
 // @desc    Get Jobs Pending QC
 // @route   GET /api/quality/pending
@@ -23,7 +24,8 @@ exports.getPendingQC = async (req, res) => {
 // @route   POST /api/quality/submit
 exports.submitQC = async (req, res) => {
   try {
-    const { jobId, sampleSize, qtyRejected, notes } = req.body;
+    // 🟢 Capture sampleSource from frontend ('Main' or 'Loose')
+    const { jobId, sampleSize, qtyRejected, notes, sampleSource } = req.body;
 
     const job = await JobCard.findOne({ jobId });
     if (!job) return res.status(404).json({ msg: 'Job not found' });
@@ -40,43 +42,65 @@ exports.submitQC = async (req, res) => {
 
     const totalBatchQty = job.totalQty || 0; 
     const rejected = Number(qtyRejected) || 0;
-    const passedQty = totalBatchQty - rejected; 
+    const passedQty = Math.max(0, totalBatchQty - rejected); 
     const inspectorName = req.user ? req.user.name : "Unknown Inspector";
 
-    // 🟢 NEW: QC HOLD TRIGGER
-    // If there is even ONE rejection, block stock addition and send to Admin
+    // 🟢 1. CALCULATE REJECTION RATE & TRIGGER HOLD LOGIC
+    const sample = Number(sampleSize) || 1; // Prevent division by zero
+    const rejectionRate = (rejected / sample) * 100;
+    const isHold = rejectionRate >= 20;
+
+    // 🟢 2. SOURCE-SPECIFIC REJECTION DEDUCTION (If applicable)
     if (rejected > 0) {
+        const targetBatch = product.stock.batches.find(b => 
+            sampleSource === 'Loose' 
+            ? (b.lotNumber.includes('LOOSE') && b.jobId === job.jobId) 
+            : (!b.lotNumber.includes('LOOSE') && b.jobId === job.jobId)
+        );
+
+        if (targetBatch) {
+            targetBatch.qty = Math.max(0, targetBatch.qty - rejected);
+            product.stock.warehouse = Math.max(0, product.stock.warehouse - rejected);
+        }
+    }
+
+    // 🟢 3. SAVE QC METADATA (Crucial for Admin Review Page display)
+    job.qcResult = {
+        status: isHold ? 'Held' : 'Passed',
+        sampleSize: Number(sampleSize),
+        rejectedQty: rejected,
+        passedQty: passedQty,
+        notes: notes || "No remarks",
+        inspector: inspectorName,
+        sampleSource: sampleSource,
+        rejectionRate: rejectionRate.toFixed(2), // 🎯 Stored for review
+        timestamp: new Date()
+    };
+
+    // 🟢 4. DIVERSE PATH LOGIC BASED ON THRESHOLD
+    if (isHold) {
         job.status = 'QC_HOLD';
         job.currentStep = 'QC_Review_Needed';
         
-        // Save the result details so Admin knows why it was held
-        job.qcResult = {
-            status: 'Held',
-            sampleSize: Number(sampleSize),
-            rejectedQty: rejected,
-            passedQty: passedQty,
-            notes: notes,
-            inspector: inspectorName,
-            timestamp: new Date()
-        };
-
         if (!job.history) job.history = [];
         job.history.push({ 
             step: 'Quality Control', 
             status: 'Held',
-            details: `QC FAILED: ${rejected} items rejected. Pending Admin Review.`,
+            details: `⚠️ CRITICAL: ${rejectionRate.toFixed(1)}% Rejection. Sent to Admin Review. Source: ${sampleSource}`,
             timestamp: new Date() 
         });
 
+        await product.save();
         await job.save();
+        
         return res.json({ 
-            success: false, 
+            success: true, // Use true so the frontend Alert shows correctly
             hold: true, 
-            msg: `QC Hold Triggered: ${rejected} units rejected. Sent to Admin Review.` 
+            msg: `⚠️ High Rejection (${rejectionRate.toFixed(1)}%). Batch moved to Admin Review.` 
         });
     }
 
-    // --- Path Logic (Only runs if rejected === 0) ---
+    // --- Path Logic (Only runs if rejection < 20%) ---
     const hasPassedAssembly = job.history?.some(h => h.step === 'Assembly QC');
 
     if (!hasPassedAssembly) {
@@ -92,16 +116,14 @@ exports.submitQC = async (req, res) => {
 
         job.currentStep = 'Packaging_Pending'; 
         job.status = 'Ready_For_Packing'; 
-        job.logisticsStatus = 'At_Source';
 
         if (!job.history) job.history = [];
         job.history.push({ 
             step: 'Assembly QC', 
             status: `SFG Verified`,
-            details: `Passed Assembly Gate. Moved to Storage.`,
+            details: `Passed Assembly Gate. Moved to Storage. Source: ${sampleSource}`,
             timestamp: new Date() 
         });
-
     } else {
         // --- GATE 2: FINAL QC ---
         product.stock.warehouse += Number(passedQty);
@@ -109,12 +131,12 @@ exports.submitQC = async (req, res) => {
             lotNumber: `FG-${job.jobId.split('-').pop()}`, 
             qty: Number(passedQty),
             date: new Date(),
-            inspector: inspectorName
+            inspector: inspectorName,
+            sampleSource: sampleSource,
+            jobId: job.jobId
         });
 
-        // Remove SFG lot as it is now Finished Goods
         product.stock.semiFinished = product.stock.semiFinished.filter(lot => lot.jobId !== job.jobId);
-
         job.status = 'Completed';
         job.currentStep = 'QC_Completed';
 
@@ -122,7 +144,7 @@ exports.submitQC = async (req, res) => {
         job.history.push({ 
             step: 'Final Quality Control', 
             status: `Verified (Final)`,
-            details: `Finished Goods moved to Warehouse.`,
+            details: `Finished Goods moved to Warehouse. Source: ${sampleSource}`,
             timestamp: new Date() 
         });
     }
@@ -130,21 +152,49 @@ exports.submitQC = async (req, res) => {
     await product.save();
     await job.save();
 
-    res.json({ success: true, msg: `QC Approved! Status: ${job.currentStep}` });
+    res.json({ success: true, msg: `✅ QC Approved! Status: ${job.currentStep}` });
   } catch (error) {
+    console.error("QC Submission Error:", error);
     res.status(500).json({ msg: error.message });
   }
 };
 
 // @desc    Get All Jobs on QC HOLD (Admin View)
-// @route   GET /api/quality/held
 exports.getHeldQC = async (req, res) => {
   try {
-    const jobs = await JobCard.find({ status: 'QC_HOLD' })
+    // 🟢 Ensure both models are available to this function
+    const JobCard = require('../models/JobCard');
+    const PurchaseOrder = require('../models/PurchaseOrder');
+
+    // 1. Fetch Production holds (Status: 'QC_HOLD')
+    const productionHolds = await JobCard.find({ status: 'QC_HOLD' })
       .populate('productId', 'name sku')
-      .sort({ updatedAt: -1 }); 
-    res.json(jobs);
+      .lean();
+
+    // 2. Fetch Purchase Order holds (Status: 'QC_Review')
+    // Note: We use 'QC_Review' because that is what your receiveOrder function sets
+    const purchaseHolds = await PurchaseOrder.find({ status: 'QC_Review' })
+      .populate('vendor_id', 'name')
+      .lean();
+
+    // 3. Normalize Purchase Orders so the UI can read them as "Jobs"
+    const formattedPOs = purchaseHolds.map(po => ({
+      ...po,
+      jobId: `PO-${po._id.toString().substr(-6)}`, // Display ID
+      isPO: true, // Flag for the frontend mapping logic
+      // Ensure the frontend has direct access to the product name
+      productName: po.itemName, 
+      updatedAt: po.updatedAt || po.createdAt
+    }));
+
+    // 4. Combine both lists into one single array for the table
+    const allHolds = [...productionHolds, ...formattedPOs].sort(
+      (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)
+    );
+
+    res.json(allHolds);
   } catch (error) {
+    console.error("Unified Approval Hub Fetch Error:", error);
     res.status(500).json({ msg: error.message });
   }
 };

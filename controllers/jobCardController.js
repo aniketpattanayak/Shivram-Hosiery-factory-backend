@@ -277,43 +277,56 @@ exports.receiveProcessV2 = async (req, res) => {
 // @desc    Vendor: Internal Stage Progression (Cutting -> Stitching)
 // @desc    Vendor: Internal Stage Progression (No Handshake Trigger)
 // backend/controllers/jobCardController.js
+// 🟢 FULLY UPDATED: updateJobStage logic
 exports.updateJobStage = async (req, res) => {
   try {
     const { jobId, stageResult } = req.body;
     const job = await JobCard.findOne({ jobId });
     if (!job) return res.status(404).json({ msg: "Job card not found" });
 
-    // 🟢 KEEPING ALL YOUR ORIGINAL INTERNAL TRANSITIONS
+    // 1. Handle Cutting Transitions
     if (stageResult === "Cutting_Started") {
       job.currentStep = "Cutting_Started";
     } 
     else if (stageResult === "Cutting_Completed") {
       job.currentStep = "Stitching_Pending"; 
     }
+    
+    // 2. Handle Stitching Transitions
     else if (stageResult === "Sewing_Started") {
       job.currentStep = "Sewing_Started";
     }
+    else if (stageResult === "Stitching_Completed") {
+      // 🟢 FIX: Move to Packaging instead of staying in Stitching
+      job.currentStep = "Packaging_Pending";
+      job.status = "In_Progress"; 
+    }
+
+    // 3. Handle Packaging Transitions
     else if (stageResult === "Packaging_Started") {
       job.currentStep = "Packaging_Started";
     }
+    else if (stageResult === "Packaging_Completed") {
+      // 🟢 FIX: After Packaging is done, move to Final QC
+      job.currentStep = "QC_Pending"; 
+      job.status = "QC_Pending"; 
+    }
 
-    // 🟢 UPDATED: History now captures 'performedBy' from the logged-in user
+    // Log the history for tracking
     job.history.push({
       step: stageResult.replace("_", " "),
       status: job.currentStep,
-      // This maps the active user to your Analytics spreadsheet
       performedBy: req.user.name, 
       timestamp: new Date()
     });
 
     await job.save();
     
-    // 🟢 Professional log to verify who moved the stage
-    console.log(`[Factory Intelligence] Stage updated to ${job.currentStep} by ${req.user.name}`);
+    console.log(`[Flow Update] Job ${jobId} moved to ${job.currentStep} by ${req.user.name}`);
 
     res.json({ 
       success: true, 
-      msg: `Internal stage updated by ${req.user.name}`, 
+      msg: `Stage updated to ${job.currentStep}`, 
       nextStep: job.currentStep 
     });
   } catch (error) {
@@ -329,45 +342,31 @@ exports.receiveProcess = async (req, res) => {
     const job = await JobCard.findOne({ jobId });
     if (!job) return res.status(404).json({ msg: "Job not found" });
 
-    let historyLog = {
-      timestamp: new Date(),
-      performedBy: req.user ? req.user.name : "Production Mgr",
-    };
+    let historyLog = { timestamp: new Date(), performedBy: req.user?.name || "Production Mgr" };
 
-    // 🟢 DETECT TRANSITION FOR TIMELINE
     if (job.currentStep === "Cutting_Started") {
       historyLog.action = "Cutting Completed";
-      historyLog.details = "Panels cut and sent to Stitching.";
-    } else if (job.currentStep === "Sewing_Started") {
+      historyLog.details = "Panels sent to Stitching.";
+    } 
+    else if (job.currentStep === "Sewing_Started") {
       historyLog.action = "Stitching Completed";
-      historyLog.details = "Stitched items sent to Gate 1 Assembly QC.";
-    } else if (job.currentStep === "Packaging_Pending") {
+      // 🟢 CHANGE: Now bypassing Assembly QC and going to Packaging
+      historyLog.details = "Stitched items sent directly to Packaging Area.";
+    } 
+    else if (job.currentStep === "Packaging_Pending") {
       historyLog.action = "Packaging Started";
-      historyLog.details = `Started packing using SFG Lot: SFG-${job.jobId
-        .split("-")
-        .pop()}`;
-    } else if (job.currentStep === "Packaging_Started") {
-      historyLog.action = "Packaging Completed";
-      historyLog.details = "Packed goods sent to Gate 2 Final QC.";
     }
 
-    if (historyLog.action) {
-      job.timeline.push(historyLog);
-    }
+    if (historyLog.action) job.timeline.push(historyLog);
 
-    // 🟢 UPDATE STATE
-    job.currentStep = nextStage;
+    // 🟢 Logic: If Stitching is done, automatically skip to Packaging if nextStage was QC
+    job.currentStep = (nextStage === "QC_Pending" && job.currentStep === "Sewing_Started") 
+        ? "Packaging_Pending" 
+        : nextStage;
 
-    // Logic: If next is QC, status must be QC_Pending to show on QC page
-    if (nextStage === "QC_Pending") {
-      job.status = "QC_Pending";
-    } else {
-      job.status = "In_Progress";
-    }
+    job.status = (job.currentStep === "QC_Pending") ? "QC_Pending" : "In_Progress";
 
     await job.save();
-    res.json({ success: true, msg: "Stage Advanced", job });
-  } catch (error) {
-    res.status(500).json({ msg: error.message });
-  }
+    res.json({ success: true, job });
+  } catch (error) { res.status(500).json({ msg: error.message }); }
 };

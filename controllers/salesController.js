@@ -31,26 +31,29 @@ exports.createQuote = async (req, res) => {
     let finalClientId = (clientId && mongoose.Types.ObjectId.isValid(clientId)) ? clientId : null;
 
     // 🟢 3. HYBRID CLIENT LOGIC: Find or Create Client
-    if (!finalClientId && clientName) {
-        // Check if client exists by name to avoid duplicates
-        const existingClient = await Client.findOne({ name: { $regex: new RegExp(`^${clientName}$`, "i") } });
-        
-        if (existingClient) {
-            finalClientId = existingClient._id;
-        } else {
-            // Create New Client in Master automatically
-            const newClient = await Client.create({
-                name: clientName,
-                address: clientAddress,
-                billToAddress: clientAddress, 
-                gstNumber: clientGst,
-                salesPerson: salesPerson,
-                status: 'Interested', 
-                leadType: 'Medium'
-            });
-            finalClientId = newClient._id;
-        }
-    }
+    // 🟢 FIXED: Respecting the selected Lead Tier
+if (!finalClientId && clientName) {
+  const existingClient = await Client.findOne({ name: { $regex: new RegExp(`^${clientName}$`, "i") } });
+  
+  if (existingClient) {
+      finalClientId = existingClient._id;
+  } else {
+      // Capture the leadType sent from frontend, or default to 'Silver'
+      const { leadType } = req.body; 
+
+      const newClient = await Client.create({
+          name: clientName,
+          address: clientAddress,
+          billToAddress: clientAddress, 
+          gstNumber: clientGst,
+          salesPerson: salesPerson || req.user?.name || 'Admin',
+          status: 'Interested', 
+          // 🟢 FIX: Use the variable leadType instead of a fixed 'Gold' string
+          leadType: leadType || 'Silver' 
+      });
+      finalClientId = newClient._id;
+  }
+}
 
     // 4. Calculate Totals
     let subTotal = 0;
@@ -155,135 +158,128 @@ exports.createOrder = async (req, res) => {
     } = req.body;
     
     // 1. Resolve Customer Identity & Tier
-    let finalCustomerId = (customerId && mongoose.Types.ObjectId.isValid(customerId)) ? customerId : null;
-    let clientDoc = null;
-
-    if (!finalCustomerId && customerName) {
-         clientDoc = await Client.findOne({ name: { $regex: new RegExp(`^${customerName}$`, "i") } }).session(session);
-         if (clientDoc) {
-             finalCustomerId = clientDoc._id;
-         } else {
-             clientDoc = new Client({
-                 name: customerName,
-                 salesPerson: req.user ? req.user.name : 'Admin',
-                 status: 'Customer',
-                 leadType: 'Silver' // Default
-             });
-             await clientDoc.save({ session });
-             finalCustomerId = clientDoc._id;
-         }
-    } else if (finalCustomerId) {
-        clientDoc = await Client.findById(finalCustomerId).session(session);
-    }
-
-    // 🟢 PRIORITY MAPPING (Diamond -> High, Gold -> Medium, Silver -> Low)
+    let clientDoc = await Client.findById(customerId).session(session);
     let mappedPriority = 'Low';
     if (clientDoc?.leadType === 'Diamond') mappedPriority = 'High';
     else if (clientDoc?.leadType === 'Gold') mappedPriority = 'Medium';
     else mappedPriority = 'Low';
 
-    const processedItems = [];
-    const productionPlansToCreate = [];
-    let grandTotal = 0;
-    let orderRequiresProduction = false;
-
-    for (const item of items) {
-      const product = await Product.findOne({ name: item.productName }).session(session);
-      let availableStock = product ? product.stock.warehouse : 0;
-      const qtyRequested = Number(item.qtyOrdered);
-
-      // 🟢 DISPLACEMENT LOGIC: Diamond orders "steal" from Silver/Gold
-      if (clientDoc?.leadType === 'Diamond' && availableStock < qtyRequested) {
-          // Find orders sitting in Dispatch that are lower priority
-          const shiftableOrders = await Order.find({
-              status: 'Ready_Dispatch',
-              priority: { $in: ['Low', 'Medium'] },
-              'items.productName': item.productName
-          }).session(session);
-
-          for (const lowOrder of shiftableOrders) {
-              if (availableStock >= qtyRequested) break;
-
-              // Displacement: Take stock, push back to Production
-              lowOrder.status = 'Production_Queued';
-              const lowItem = lowOrder.items.find(i => i.productName === item.productName);
-              
-              availableStock += (lowItem.qtyAllocated || 0);
-              lowItem.qtyAllocated = 0;
-              lowItem.qtyToProduce = lowItem.qtyOrdered;
-              
-              await lowOrder.save({ session });
-
-              // Create new Production Plan for the "robbed" order
-              await ProductionPlan.create([{
-                  planId: `PP-DISP-${Date.now()}-${Math.floor(Math.random() * 9000)}`,
-                  orderId: lowOrder._id,
-                  product: lowItem.product,
-                  totalQtyToMake: lowItem.qtyOrdered,
-                  status: 'Pending Strategy'
-              }], { session });
-          }
-      }
-
-      // 2. Allocation Decision
-      const canAllocate = availableStock >= qtyRequested;
-      const qtyAllocated = canAllocate ? qtyRequested : 0;
-      const qtyToProduce = canAllocate ? 0 : qtyRequested;
-
-      if (qtyToProduce > 0) {
-        orderRequiresProduction = true;
-        productionPlansToCreate.push({
-          planId: `PP-${Date.now()}-${Math.floor(Math.random() * 9000)}`, 
-          product: product?._id, 
-          totalQtyToMake: qtyToProduce, 
-          status: 'Pending Strategy'
-        });
-      }
-
-      const finalPrice = item.unitPrice !== undefined ? Number(item.unitPrice) : (product?.sellingPrice || 0);
-      grandTotal += (finalPrice * qtyRequested);
-
-      processedItems.push({
-        product: product ? product._id : null,
+    // 2. Map Items and Save the New Order (As draft for now)
+    const processedItems = items.map(item => ({
+        product: item.productId,
         productName: item.productName,
-        qtyOrdered: qtyRequested,
-        qtyAllocated: qtyAllocated,
-        qtyToProduce: qtyToProduce,
-        unitPrice: finalPrice,
-        itemTotal: (finalPrice * qtyRequested),
-        promiseDate: item.promiseDate 
-      });
-    }
-
-    // 3. Final Routing
-    const finalStatus = orderRequiresProduction ? 'Production_Queued' : 'Ready_Dispatch';
+        qtyOrdered: Number(item.qtyOrdered),
+        qtyAllocated: 0, 
+        qtyToProduce: Number(item.qtyOrdered),
+        unitPrice: item.unitPrice || 0
+    }));
 
     const newOrder = new Order({
-      orderId: `ORD-${new Date().getFullYear()}-${Math.floor(Math.random() * 9000)}`,
-      customerName: customerName,
-      clientId: finalCustomerId, 
+      orderId: `ORD-2026-${Math.floor(1000 + Math.random() * 9000)}`,
+      customerName,
+      clientId: customerId, 
       items: processedItems,
-      grandTotal: grandTotal, 
-      deliveryDate: deliveryDate,
+      deliveryDate,
       priority: mappedPriority, 
-      status: finalStatus,
-      advanceReceived: advanceReceived || false, 
-      advanceAmount: advanceReceived ? (advanceAmount || 0) : 0
+      status: 'Production_Queued'
     });
 
+    // CRITICAL: Save and wait to ensure newOrder._id is ready for logic
     await newOrder.save({ session });
 
-    if (productionPlansToCreate.length > 0) {
-      const plans = productionPlansToCreate.map(plan => ({ ...plan, orderId: newOrder._id }));
-      await ProductionPlan.insertMany(plans, { session });
+    // 3. 🟢 GLOBAL WATERFALL RE-ALLOCATION
+    // We check every product involved in the order to re-rank the whole system
+    const uniqueProductNames = [...new Set(items.map(i => i.productName))];
+
+    for (const pName of uniqueProductNames) {
+      const product = await Product.findOne({ name: pName }).session(session);
+      if (!product) continue;
+
+      // Find ALL pending orders waiting for this specific product
+      const allPending = await Order.find({ 
+        'items.productName': pName, 
+        status: { $in: ['Production_Queued', 'Ready_Dispatch', 'Partially_Dispatched'] } 
+      }).session(session);
+
+      // STEP A: Release all 'Secured' stock into the temporary calculation pool
+      let totalPhysicalPool = product.stock.warehouse || 0;
+      allPending.forEach(ord => {
+        const target = ord.items?.find(i => i.productName === pName);
+        if (target) {
+            totalPhysicalPool += (target.qtyAllocated || 0);
+            target.qtyAllocated = 0; // Release for re-allocation
+        }
+      });
+
+      // STEP B: Sort by Tier (Diamond > Gold > Silver) then by Oldest Date (FIFO)
+      const weightMap = { 'High': 3, 'Medium': 2, 'Low': 1 };
+      allPending.sort((a, b) => {
+        const weightA = weightMap[a.priority] || 0;
+        const weightB = weightMap[b.priority] || 0;
+        if (weightB !== weightA) return weightB - weightA;
+        return new Date(a.createdAt) - new Date(b.createdAt); // Earliest Date first
+      });
+
+      // STEP C: Distribute the Physical Pool (e.g., your 1,121 PCS)
+      let remainingStock = totalPhysicalPool;
+      for (const ord of allPending) {
+        const itemInOrd = ord.items?.find(i => i.productName === pName);
+        if (!itemInOrd) continue;
+
+        const needed = (itemInOrd.qtyOrdered || 0) - (itemInOrd.qtyDispatched || 0);
+
+        if (remainingStock > 0) {
+          const allocation = Math.min(needed, remainingStock);
+          itemInOrd.qtyAllocated = allocation;
+          itemInOrd.qtyToProduce = needed - allocation;
+          remainingStock -= allocation;
+        } else {
+          itemInOrd.qtyAllocated = 0;
+          itemInOrd.qtyToProduce = needed;
+        }
+
+        // Update Order Status based on allocation
+        const isFullySecured = ord.items?.every(i => 
+          (i.qtyAllocated || 0) >= ((i.qtyOrdered || 0) - (i.qtyDispatched || 0))
+        );
+        ord.status = isFullySecured ? 'Ready_Dispatch' : 'Production_Queued';
+        await ord.save({ session });
+      }
+
+      // Update actual product warehouse stock with unallocated remainder
+      product.stock.warehouse = Math.max(0, remainingStock); 
+      await product.save({ session });
+
+      // 4. SYNC PRODUCTION PLANS
+      // Clear old pending plans and insert fresh ones for everyone affected
+      const affectedOrderIds = allPending.map(o => o._id).filter(id => id != null);
+      await ProductionPlan.deleteMany({ 
+        orderId: { $in: affectedOrderIds }, 
+        status: 'Pending Strategy' 
+      }).session(session);
+
+      const plansToInsert = [];
+      for (const ord of allPending) {
+        const item = ord.items?.find(i => i.productName === pName);
+        if (ord._id && item && item.qtyToProduce > 0) {
+          plansToInsert.push({
+            planId: `PP-${Date.now()}-${Math.floor(Math.random() * 999)}`,
+            orderId: ord._id, 
+            product: product._id, 
+            totalQtyToMake: item.qtyToProduce,
+            status: 'Pending Strategy'
+          });
+        }
+      }
+      if (plansToInsert.length > 0) await ProductionPlan.insertMany(plansToInsert, { session });
     }
 
     await session.commitTransaction();
     res.status(201).json({ success: true, order: newOrder });
 
   } catch (error) {
-    await session.abortTransaction();
-    console.error("Create Order Error:", error);
+    if (session.inTransaction()) await session.abortTransaction();
+    console.error("Order Creation Error:", error.message);
     res.status(500).json({ success: false, msg: error.message });
   } finally {
     session.endSession();

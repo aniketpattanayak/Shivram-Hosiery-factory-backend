@@ -8,8 +8,13 @@ const SurplusLedger = require('../models/SurplusLedger');
 // @desc Process Purchase (PO Generation - Standard)
 exports.createPurchase = async (req, res) => {
     try {
-        const { vendor, itemId, itemType, qty, unitPrice } = req.body;
-        const totalAmount = Number(qty) * Number(unitPrice);
+        const { vendor, itemId, itemType, qty, unitPrice, discountPercent, gstPercent } = req.body;
+        
+        // Calculation Logic
+        const gross = Number(qty) * Number(unitPrice);
+        const discountAmount = gross * (Number(discountPercent || 0) / 100);
+        const taxable = gross - discountAmount;
+        const totalAmount = taxable + (taxable * (Number(gstPercent || 0) / 100));
         
         let itemName = 'Unknown Item';
         let fetchedItem = null;
@@ -33,7 +38,9 @@ exports.createPurchase = async (req, res) => {
             orderedQty: Number(qty),
             receivedQty: 0,
             unitPrice: Number(unitPrice),
-            totalAmount: totalAmount,
+            discountPercent: Number(discountPercent || 0), // Save original discount
+            gstPercent: Number(gstPercent || 0),           // Save original GST
+            totalAmount: totalAmount,                      // Final Calculated Total
             status: 'Pending'
         });
 
@@ -46,6 +53,7 @@ exports.createPurchase = async (req, res) => {
 };
 
 // 🟢 NEW: Direct Stock Entry (Updates Stock & Creates Batch)
+// 🟢 UPDATED: Direct Stock Entry with Box + Loose Lot Management
 exports.createDirectEntry = async (req, res) => {
     const session = await require('mongoose').startSession();
     session.startTransaction();
@@ -58,83 +66,96 @@ exports.createDirectEntry = async (req, res) => {
         const vendorName = vendorDoc ? vendorDoc.name : "Unknown Vendor";
 
         for (const item of items) {
-            const lineTotal = Number(item.qty) * Number(item.rate);
+            // 🟢 Robust calculation for Direct Entry row
+            const calculatedQty = (Number(item.breakdown?.noOfBoxes || 0) * Number(item.breakdown?.qtyPerBox || 0)) + Number(item.breakdown?.looseQty || 0);
+            const finalQty = calculatedQty > 0 ? calculatedQty : (Number(item.qty) || 0);
+        
+            // 🛑 Skip if invalid to prevent NaN ledger entries
+            if (finalQty <= 0) continue; 
+        
+            const lineTotal = Number(item.totalAmount) || (finalQty * Number(item.rate || 0));
             grandTotal += lineTotal;
             let itemName = "Unknown";
             
-            // 🟢 ARCHITECT FIX: Generate ID ONCE for both Ledger and Batch
-            const finalBatchNumber = item.batch && item.batch.trim() !== "" 
+            const baseBatch = item.batch && item.batch.trim() !== "" 
                 ? item.batch 
                 : `DIR-${Date.now()}-${Math.floor(Math.random()*1000)}`;
-
-            const batchEntry = {
-                lotNumber: finalBatchNumber,
-                qty: Number(item.qty),
-                addedAt: new Date()
-            };
-
-            // 🟢 SURPLUS LOGIC (Using synchronized finalBatchNumber)
-            const orderedAmount = Number(item.orderedQty) || Number(item.qty); 
-            if (Number(item.qty) > orderedAmount) {
-                await SurplusLedger.create([{
-                    lotNumber: finalBatchNumber, // 🎯 Synchronized
-                    vendorName: vendorName,
-                    itemId: item.itemId,
-                    itemName: item.label || "Item",
-                    itemType: item.itemType,
-                    orderedQty: orderedAmount,
-                    receivedQty: Number(item.qty),
-                    surplusAdded: Number(item.qty) - orderedAmount
-                }], { session });
+        
+            const batchesToCreate = [];
+        
+            // 🟢 Box + Loose Lot Splitting
+            if (item.breakdown?.noOfBoxes > 0) {
+                batchesToCreate.push({
+                    lotNumber: `${baseBatch}-BOX`,
+                    qty: Number(item.breakdown.noOfBoxes) * Number(item.breakdown.qtyPerBox),
+                    boxCount: Number(item.breakdown.noOfBoxes),
+                    isLoose: false,
+                    addedAt: new Date()
+                });
             }
-
-            // 🟢 UPDATE INVENTORY (Using synchronized finalBatchNumber)
+        
+            if (item.breakdown?.looseQty > 0) {
+                batchesToCreate.push({
+                    lotNumber: `${baseBatch}-LOOSE`,
+                    qty: Number(item.breakdown.looseQty),
+                    isLoose: true,
+                    addedAt: new Date()
+                });
+            }
+        
+            if (batchesToCreate.length === 0) {
+                batchesToCreate.push({ lotNumber: baseBatch, qty: finalQty, addedAt: new Date() });
+            }
+        
+            // Update Inventory
             if (item.itemType === 'Raw Material') {
                 const mat = await Material.findById(item.itemId).session(session);
                 if (mat) {
-                    mat.stock.current += Number(item.qty);
+                    mat.stock.current += finalQty;
                     if (!mat.stock.batches) mat.stock.batches = [];
-                    mat.stock.batches.push(batchEntry);
+                    mat.stock.batches.push(...batchesToCreate);
                     itemName = mat.name;
                     await mat.save({ session });
                 }
             } else if (item.itemType === 'Finished Good') {
                 const prod = await Product.findById(item.itemId).session(session);
                 if (prod) {
-                    prod.stock.warehouse += Number(item.qty);
-                    if (!prod.stock) prod.stock = { warehouse: 0, reserved: 0, batches: [] };
+                    prod.stock.warehouse += finalQty;
                     if (!prod.stock.batches) prod.stock.batches = [];
-                    prod.stock.batches.push(batchEntry);
+                    prod.stock.batches.push(...batchesToCreate);
                     itemName = prod.name;
                     await prod.save({ session });
                 }
             }
-
+        
             const entry = await PurchaseOrder.create([{
                 item_id: item.itemId,
                 vendor_id: vendorId,
                 itemName: itemName,
                 itemType: item.itemType,
-                orderedQty: orderedAmount,
-                receivedQty: Number(item.qty),
+                orderedQty: finalQty,
+                receivedQty: finalQty,
                 unitPrice: Number(item.rate),
                 totalAmount: lineTotal,
                 isDirectEntry: true,
                 status: 'Completed',
-                batchNumber: finalBatchNumber // 🎯 Traceable ID
+                batchNumber: baseBatch,
+                breakdown: item.breakdown
             }], { session });
             
             createdEntries.push(entry[0]);
         }
 
+        // Update Vendor Balance
         if (vendorId) {
             await Vendor.findByIdAndUpdate(vendorId, { $inc: { balance: grandTotal } }).session(session);
         }
 
         await session.commitTransaction();
-        res.status(201).json({ success: true, msg: "Stock Added!", entries: createdEntries });
+        res.status(201).json({ success: true, msg: "Stock Added with Box/Loose breakdown!", entries: createdEntries });
     } catch (error) {
         await session.abortTransaction();
+        console.error("Direct Entry Error:", error);
         res.status(500).json({ msg: error.message });
     } finally {
         session.endSession();

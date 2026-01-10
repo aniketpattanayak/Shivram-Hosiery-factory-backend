@@ -12,7 +12,7 @@ exports.getUsers = async (req, res) => {
 };
 
 // @desc    Add New User (With Permissions)
-exports.createUser = async (req, res) => {
+exports.createUser = async (req, res, next) => {
   try {
     const { name, email, password, role, permissions } = req.body;
 

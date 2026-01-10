@@ -38,12 +38,12 @@ const JobCardSchema = new mongoose.Schema({
       'Cutting_Started', 
       'Cutting_Completed',
       'Stitching_Pending',   
-      'Sewing_Started',      // Consistently used for the Stitching process
+      'Sewing_Started',      
       'Stitching_Completed', 
-      'Packaging_Pending',   // 🟢 GATE 1 PASS: Waiting for worker to start packing
-      'Packaging_Started',   // 🟢 PACKING IN PROGRESS
-      'QC_Pending',          // 🟢 ACTIVE QC GATE (Used for both Gate 1 and Gate 2)
-      'QC_Completed',        // FINAL STAGE
+      'Packaging_Pending',   // 🟢 DIRECT LINK: Now follows Stitching_Completed
+      'Packaging_Started',   
+      'QC_Pending',          // 🟢 Final QC Only (Gate 2)
+      'QC_Completed',        
       'Procurement_Pending', 
       'PO_Raised',
       'QC_Review_Needed',

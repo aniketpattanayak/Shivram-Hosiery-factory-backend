@@ -1,12 +1,11 @@
 const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
-const ProductionPlan = require('../models/ProductionPlan'); // 🟢 Required to update plan
+const ProductionPlan = require('../models/ProductionPlan');
 
 // @desc    Get Orders Ready for Dispatch
 exports.getDispatchOrders = async (req, res) => {
   try {
-    // 🟢 UPDATED: Show orders that are NOT fully dispatched
     const orders = await Order.find({ status: { $nin: ['Dispatched', 'Cancelled'] } })
       .populate('items.product')
       .populate({ path: 'clientId', select: 'address' }); 
@@ -17,16 +16,15 @@ exports.getDispatchOrders = async (req, res) => {
   }
 };
 
-// @desc    Get Dispatch History (Including Partially Dispatched Orders)
+// @desc    Get Dispatch History
 exports.getDispatchHistory = async (req, res) => {
   try {
-    // 🟢 ARCHITECT FIX: Use $in to find both Fully and Partially dispatched orders
     const history = await Order.find({ 
         status: { $in: ['Dispatched', 'Partially_Dispatched'] } 
     })
       .populate('items.product')
       .populate({ path: 'clientId', select: 'address' })
-      .sort({ 'dispatchDetails.dispatchedAt': -1 }); // Show most recent first
+      .sort({ 'dispatchDetails.dispatchedAt': -1 });
       
     res.json(history);
   } catch (error) {
@@ -40,38 +38,49 @@ exports.shipOrder = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    // 🟢 itemsToShip = [{ productId, qtyToShip }]
     const { orderId, transportDetails, itemsToShip } = req.body;
     
+    // 🟢 Safety Check: Ensure order exists
     const order = await Order.findOne({ orderId }).session(session);
-    if (!order) throw new Error('Order not found');
+    if (!order) throw new Error(`Order ${orderId} not found in database.`);
 
     let allItemsFullyShipped = true;
 
     for (const shipItem of itemsToShip) {
+      // 🛡️ SHIELD: Fix for 'toString' of undefined error
+      if (!shipItem || !shipItem.productId) {
+          console.error("Skipping item: Product ID is missing in request payload.");
+          continue;
+      }
+
       const qtyToShip = Number(shipItem.qtyToShip);
       if (qtyToShip <= 0) continue; 
 
-      // Find corresponding item in the Order
-      const itemInOrder = order.items.find(i => i.product.toString() === shipItem.productId);
-      if (!itemInOrder) continue;
+      // 🛡️ SHIELD: Ensure the item actually exists in this specific order
+      const itemInOrder = order.items.find(i => i.product && i.product.toString() === shipItem.productId.toString());
+      if (!itemInOrder) {
+          console.warn(`Warning: Product ID ${shipItem.productId} is not part of Order ${orderId}.`);
+          continue;
+      }
 
       // 1. DEDUCT PHYSICAL STOCK
       const product = await Product.findById(shipItem.productId).session(session);
       if (product) {
-        product.stock.warehouse -= qtyToShip;
+        // Ensure we don't go below zero stock accidentally
+        product.stock.warehouse = Math.max(0, product.stock.warehouse - qtyToShip);
         await product.save({ session });
 
         // 2. UPDATE PRODUCTION PLAN
+        // 🟢 ARCHITECT FIX: Try finding plan by both MongoDB _id and String orderId
         const plan = await ProductionPlan.findOne({ 
-            orderId: order._id, 
+            $or: [{ orderId: order._id }, { orderId: order.orderId }], 
             product: product._id 
         }).session(session);
 
         if (plan) {
             plan.dispatchedQty = (plan.dispatchedQty || 0) + qtyToShip;
-            // Complete plan if total made + total dispatched hits the target
-            if ((plan.plannedQty || 0) + plan.dispatchedQty >= plan.totalQtyToMake) {
+            // Mark fulfilled if Target is met
+            if ((plan.producedQty || 0) >= plan.totalQtyToMake && plan.dispatchedQty >= plan.totalQtyToMake) {
                 plan.status = 'Fulfilled_By_Stock'; 
             }
             await plan.save({ session });
@@ -83,7 +92,6 @@ exports.shipOrder = async (req, res) => {
     }
 
     // 4. DETERMINE FINAL ORDER STATUS
-    // Check if every item in the order is now fully dispatched
     for (const item of order.items) {
         if ((item.qtyDispatched || 0) < item.qtyOrdered) {
             allItemsFullyShipped = false;
@@ -93,7 +101,15 @@ exports.shipOrder = async (req, res) => {
 
     order.status = allItemsFullyShipped ? 'Dispatched' : 'Partially_Dispatched';
     
-    // Save Dispatch History for this specific truck/trip
+    // 5. UPDATE DISPATCH LOGS
+    if (!order.dispatchHistory) order.dispatchHistory = [];
+    order.dispatchHistory.push({
+        ...transportDetails,
+        itemsShipped: itemsToShip,
+        dispatchedAt: new Date()
+    });
+
+    // Support for legacy UI field
     order.dispatchDetails = {
         ...transportDetails,
         dispatchedAt: new Date()
@@ -110,7 +126,7 @@ exports.shipOrder = async (req, res) => {
 
   } catch (error) {
     await session.abortTransaction();
-    console.error("Ship Error:", error);
+    console.error("Critical Dispatch Error:", error.message);
     res.status(500).json({ msg: error.message });
   } finally {
     session.endSession();
