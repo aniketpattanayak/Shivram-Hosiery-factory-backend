@@ -162,34 +162,48 @@ exports.submitQC = async (req, res) => {
 // @desc    Get All Jobs on QC HOLD (Admin View)
 exports.getHeldQC = async (req, res) => {
   try {
-    // 🟢 Ensure both models are available to this function
     const JobCard = require('../models/JobCard');
     const PurchaseOrder = require('../models/PurchaseOrder');
 
-    // 1. Fetch Production holds (Status: 'QC_HOLD')
+    // 1. Fetch Production holds
     const productionHolds = await JobCard.find({ status: 'QC_HOLD' })
       .populate('productId', 'name sku')
       .lean();
 
-    // 2. Fetch Purchase Order holds (Status: 'QC_Review')
-    // Note: We use 'QC_Review' because that is what your receiveOrder function sets
-    const purchaseHolds = await PurchaseOrder.find({ status: 'QC_Review' })
-      .populate('vendor_id', 'name')
-      .lean();
+    // 2. Fetch Purchase Order holds
+    const reviewOrders = await PurchaseOrder.find({ "items.status": "QC_Review" })
+        .populate('vendor_id', 'name')
+        .lean();
 
-    // 3. Normalize Purchase Orders so the UI can read them as "Jobs"
-    const formattedPOs = purchaseHolds.map(po => ({
-      ...po,
-      jobId: `PO-${po._id.toString().substr(-6)}`, // Display ID
-      isPO: true, // Flag for the frontend mapping logic
-      // Ensure the frontend has direct access to the product name
-      productName: po.itemName, 
-      updatedAt: po.updatedAt || po.createdAt
-    }));
+    // 3. 🟢 FLATTEN PO items so they match the Frontend review structure
+    let flattenedPOs = [];
+    for (const order of reviewOrders) {
+        for (const item of order.items) {
+            if (item.status === 'QC_Review') {
+                const lastLog = item.history[item.history.length - 1] || {};
+                flattenedPOs.push({
+                    _id: item._id, // Unique ID for React key
+                    orderId: order._id, // 🎯 CRITICAL: Frontend uses this to detect isPO
+                    itemId: item.item_id, // 🎯 CRITICAL: For decision API
+                    poNumber: order._id.toString().slice(-6),
+                    date: order.createdAt,
+                    createdAt: order.createdAt,
+                    inspector: lastLog.receivedBy || "Inspector",
+                    feedback: lastLog.status || "High Rejection Rate",
+                    rejectedQty: Number(lastLog.rejected || 0),
+                    receivedQty: Number(lastLog.qty || 0),
+                    sampleSize: Number(item.qcSampleQty || lastLog.qty || 1),
+                    itemName: item.itemName,
+                    itemType: item.itemType,
+                    isPO: true 
+                });
+            }
+        }
+    }
 
-    // 4. Combine both lists into one single array for the table
-    const allHolds = [...productionHolds, ...formattedPOs].sort(
-      (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)
+    // 4. Combine both lists
+    const allHolds = [...productionHolds, ...flattenedPOs].sort(
+      (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
     );
 
     res.json(allHolds);

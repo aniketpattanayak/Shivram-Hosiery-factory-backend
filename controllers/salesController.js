@@ -314,20 +314,36 @@ exports.getLeads = async (req, res) => {
 
 exports.createLead = async (req, res) => {
   try {
+    // 1. Maintain your Lead ID generation logic
     const count = await Lead.countDocuments();
     const leadId = `LD-${String(count + 1).padStart(3, '0')}`;
+    
+    // 2. Maintain your Salesperson ownership logic
     let salesPersonName = req.body.salesPerson;
     if (req.user && (req.user.role === 'Sales Man' || req.user.role === 'Salesman')) {
         salesPersonName = req.user.name;
     }
+
+    // 3. Create the Lead
+    // We spread req.body, but since you've removed Lead Tier and Commercials 
+    // from the frontend, those fields will naturally be empty/undefined here.
     const newLead = await Lead.create({
-      ...req.body,
+      ...req.body, 
       salesPerson: salesPersonName, 
       leadId,
-      activityLog: [{ status: 'New', remarks: 'Lead Created', updatedBy: req.user ? req.user.name : 'System' }]
+      // We set a default leadType since the UI field is removed
+      leadType: 'Silver', 
+      activityLog: [{ 
+        status: 'New', 
+        remarks: 'Lead Created (Simplified Form)', 
+        updatedBy: req.user ? req.user.name : 'System',
+        date: new Date() 
+      }]
     });
+
     res.status(201).json(newLead);
   } catch (error) {
+    console.error("Create Lead Error:", error);
     res.status(500).json({ msg: error.message });
   }
 };

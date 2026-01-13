@@ -17,7 +17,7 @@ const ClientSchema = new mongoose.Schema({
   creditLimit: { type: Number, default: 0 }, // Max credit allowed
   creditPeriod: { type: Number, default: 0 }, // Days
 
-  salesPerson: { type: String, required: true }, // Who owns this client?
+  salesPerson: { type: String, required: false }, // Who owns this client?
 
   // 🟢 NEW: Store Multiple Interested Products
   interestedProducts: [{

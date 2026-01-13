@@ -20,15 +20,45 @@ exports.getOpenOrders = async (req, res) => {
   };
 
   // 🟢 NEW: Get items waiting for Admin Review (Rejection > 20%)
-exports.getQCReviewList = async (req, res) => {
+  exports.getQCReviewList = async (req, res) => {
     try {
-        const reviewList = await PurchaseOrder.find({ 
-            status: 'QC_Review' 
-        })
-        .populate('vendor_id', 'name')
-        .sort({ updated_at: -1 });
-        
-        res.json(reviewList);
+        // Find POs where any item is in 'QC_Review'
+        const reviewOrders = await PurchaseOrder.find({ "items.status": "QC_Review" })
+            .populate('vendor_id', 'name')
+            .sort({ updatedAt: -1 });
+
+        let flattenedReviewList = [];
+
+        for (const order of reviewOrders) {
+            for (const item of order.items) {
+                if (item.status === 'QC_Review') {
+                    const lastLog = item.history[item.history.length - 1] || {};
+                    
+                    // 🎯 SAFETY: If itemName is missing in the array, we can use a fallback
+                    // or do a quick lookup if needed. For now, we trust the item.itemName 
+                    // we saved during createPurchase.
+                    
+                    flattenedReviewList.push({
+                        orderId: order._id,
+                        itemId: item.item_id,
+                        poNumber: order._id.toString().slice(-6),
+                        date: order.createdAt,
+                        vendorName: order.vendor_id?.name || "Unknown Vendor",
+                        itemName: item.itemName || "Product ID: " + item.item_id.toString().slice(-4), 
+                        itemType: item.itemType || "Raw Material",
+                        
+                        // Metrics
+                        rejectedQty: Number(lastLog.rejected || 0),
+                        receivedQty: Number(lastLog.qty || 0),
+                        sampleSize: Number(item.qcSampleQty || lastLog.qty || 1), 
+                        inspector: lastLog.receivedBy || "Inspector",
+                        feedback: lastLog.status || "High Rejection Rate",
+                        totalBatchValue: lastLog.totalBatchValue || 0
+                    });
+                }
+            }
+        }
+        res.json(flattenedReviewList);
     } catch (error) {
         res.status(500).json({ msg: error.message });
     }
@@ -37,12 +67,12 @@ exports.getQCReviewList = async (req, res) => {
 // 🟢 NEW: Get Completed History
 exports.getCompletedHistory = async (req, res) => {
     try {
-        // Fetch Completed orders OR Partial orders with some history
+        // Find any PO where at least one item has been partially or fully received
         const orders = await PurchaseOrder.find({ 
-            receivedQty: { $gt: 0 } 
+            "items.receivedQty": { $gt: 0 } 
         })
         .populate('vendor_id', 'name')
-        .sort({ 'history.date': -1 }); // Sort by latest activity
+        .sort({ updated_at: -1 }); 
         
         res.json(orders);
     } catch (error) {
@@ -123,12 +153,12 @@ exports.receiveOrder = async (req, res) => {
     const session = await require('mongoose').startSession();
     session.startTransaction();
     try {
-        const { id } = req.params;
+        const { id } = req.params; // The PO ID
         const { 
+            itemId, // 🎯 NEW: Identifies which item in the array is being received
             qtyReceived, lotNumber, 
             mode, qcBy, sampleSize, rejectedQty,
             breakdown,
-            // 🟢 NEW: Financial Overrides from Frontend
             discountPercent, 
             gstPercent 
         } = req.body;
@@ -136,10 +166,15 @@ exports.receiveOrder = async (req, res) => {
         const order = await PurchaseOrder.findById(id).session(session).populate('vendor_id');
         if (!order) return res.status(404).json({ msg: 'Order not found' });
 
-        // Import Vendor model locally if not already at the top of the file
-        const Vendor = require('../models/Vendor');
+        // 1. 🎯 FIND THE SPECIFIC ITEM in the items array
+        const itemIndex = order.items.findIndex(i => i.item_id.toString() === itemId.toString());
+        if (itemIndex === -1) {
+            await session.abortTransaction();
+            return res.status(404).json({ msg: "Item not found in this Purchase Order" });
+        }
+        const currentItem = order.items[itemIndex];
 
-        // 1. Robust calculation for total quantity
+        // 2. Robust calculation for total quantity
         let finalReceivedQty = 0;
         if (breakdown && typeof breakdown === 'object') {
             finalReceivedQty = (Number(breakdown.noOfBoxes || 0) * Number(breakdown.qtyPerBox || 0)) + Number(breakdown.looseQty || 0);
@@ -147,151 +182,84 @@ exports.receiveOrder = async (req, res) => {
             finalReceivedQty = Number(qtyReceived) || 0;
         }
 
-        // 2. STOP: Prevents "NaN" or empty requests from processing
         if (finalReceivedQty <= 0) {
             await session.abortTransaction();
-            return res.status(400).json({ 
-                success: false, 
-                msg: "Error: Received quantity is 0. Please check your Box/Loose inputs." 
-            });
+            return res.status(400).json({ success: false, msg: "Received quantity is 0." });
         }
 
-        // 🟢 3. FINANCIAL CALCULATION FOR THIS BATCH
-        // Calculate based on current batch qty and overrides
-        const unitPrice = Number(order.unitPrice) || 0;
+        // 3. FINANCIAL CALCULATION (Per Item Lot)
+        const unitPrice = Number(currentItem.unitPrice) || 0;
         const discRate = Number(discountPercent) !== undefined ? Number(discountPercent) : (Number(order.discountPercent) || 0);
         const taxRate = Number(gstPercent) !== undefined ? Number(gstPercent) : (Number(order.gstPercent) || 18);
 
         const batchGross = finalReceivedQty * unitPrice;
-        const batchDiscountAmount = batchGross * (discRate / 100);
-        const batchTaxable = batchGross - batchDiscountAmount;
-        const batchTaxAmount = batchTaxable * (taxRate / 100);
-        const batchFinalTotal = batchTaxable + batchTaxAmount;
+        const batchTaxable = batchGross - (batchGross * (discRate / 100));
+        const batchFinalTotal = batchTaxable + (batchTaxable * (taxRate / 100));
 
         let stockToAdd = 0;
-        let finalStatus = 'Partial'; 
-        let historyStatus = 'Received';
-        let responseMsg = "";
         let isHighRejection = false; 
+        let historyStatus = 'Received';
+        const baseBatchId = lotNumber || `PO-${order._id.toString().substr(-4)}-${Date.now()}`;
 
-        const baseBatchId = lotNumber && lotNumber.trim() !== "" 
-            ? lotNumber 
-            : `PO-${order._id.toString().substr(-4)}-${Date.now()}`;
-
+        // 4. QC LOGIC
         // --- QC LOGIC ---
-        if (mode === 'qc') {
-            const size = Number(sampleSize) > 0 ? Number(sampleSize) : finalReceivedQty;
-            const rejectionRate = (Number(rejectedQty) / size) * 100;
-            
-            if (rejectionRate > 20) {
-                isHighRejection = true;
-                order.status = 'QC_Review'; // 🎯 Status used for Material Purchases
-                order.qcStatus = 'Failed'; 
-                
-                // 🟢 ADD: Store metadata so the Admin Review table can display it
-                order.qcResult = {
-                    rejectedQty: Number(rejectedQty),
-                    sampleSize: Number(sampleSize),
-                    notes: req.body.reason || "High Rejection during GRN",
-                    rejectionRate: rejectionRate.toFixed(2),
-                    timestamp: new Date()
-                };
-                
-                historyStatus = `QC Failed (${rejectionRate.toFixed(1)}%)`;
-                responseMsg = `⚠️ High Rejection (${rejectionRate.toFixed(1)}%). Sent to Admin Review.`;
-                stockToAdd = 0; 
-            } else {
-                historyStatus = 'QC Passed';
-                stockToAdd = finalReceivedQty - Number(rejectedQty); 
-                responseMsg = `✅ QC Passed. Added ${stockToAdd} Good Units. Batch Value: ₹${batchFinalTotal.toFixed(2)}`;
+        // --- QC LOGIC INSIDE receiveOrder ---
+if (mode === 'qc') {
+    // 1. Calculate the rejection percentage for this batch
+    const size = Number(sampleSize) > 0 ? Number(sampleSize) : finalReceivedQty;
+    const rejectionRate = (Number(rejectedQty) / size) * 100;
+    
+    if (rejectionRate > 20) {
+        // 🎯 TRIGGER ADMIN REVIEW HOLD
+        isHighRejection = true;
+        
+        // Update statuses to QC_Review (requires the updated Model enum)
+        order.status = 'QC_Review'; 
+        currentItem.status = 'QC_Review'; 
+        
+        historyStatus = `QC Failed (${rejectionRate.toFixed(1)}%) - Sent to Admin`;
+        
+        // 🛡️ IMPORTANT: Stock and Vendor Balance updates are skipped
+        stockToAdd = 0; 
+        responseMsg = `⚠️ High Rejection (${rejectionRate.toFixed(1)}%). Sent for Admin Approval.`;
+    } else {
+        // 🎯 QC PASSED (Normal Flow)
+        historyStatus = 'QC Passed';
+        stockToAdd = finalReceivedQty - Number(rejectedQty); 
+        responseMsg = `✅ QC Passed. Added ${stockToAdd} Good Units.`;
+    }
+}
+
+        // 5. UPDATE VENDOR BALANCE & INVENTORY
+        if (!isHighRejection) {
+            if (batchFinalTotal > 0) {
+                const Vendor = require('../models/Vendor');
+                await Vendor.findByIdAndUpdate(order.vendor_id, { $inc: { balance: batchFinalTotal } }).session(session);
             }
-        } else {
-            stockToAdd = finalReceivedQty;
-            historyStatus = 'Direct Receive';
-            responseMsg = `✅ Direct Receive. Added ${stockToAdd} Units. Batch Value: ₹${batchFinalTotal.toFixed(2)}`;
-        }
 
-        // 🟢 4. UPDATE VENDOR BALANCE
-        // Only update balance if stock is actually accepted (not held in QC review)
-        if (!isHighRejection && batchFinalTotal > 0) {
-            await Vendor.findByIdAndUpdate(order.vendor_id, {
-                $inc: { balance: batchFinalTotal }
-            }).session(session);
-        }
-
-        // 5. SUB-BATCH LOGIC (BOX vs LOOSE)
-        const batchesToCreate = [];
-        if (stockToAdd > 0 && !isHighRejection) {
-            if (breakdown) {
-                if (Number(breakdown.noOfBoxes) > 0) {
-                    batchesToCreate.push({
-                        lotNumber: `${baseBatchId}-BOX`,
-                        qty: (Number(breakdown.noOfBoxes) * Number(breakdown.qtyPerBox)),
-                        boxCount: Number(breakdown.noOfBoxes),
-                        isLoose: false,
-                        addedAt: new Date()
-                    });
-                }
-                if (Number(breakdown.looseQty) > 0) {
-                    batchesToCreate.push({
-                        lotNumber: `${baseBatchId}-LOOSE`,
-                        qty: Number(breakdown.looseQty),
-                        isLoose: true,
-                        addedAt: new Date()
-                    });
-                }
-            } else {
-                batchesToCreate.push({ lotNumber: baseBatchId, qty: stockToAdd, addedAt: new Date() });
-            }
-        }
-
-        // --- SURPLUS TRACKING ---
-        if (stockToAdd > 0 && !isHighRejection) {
-            const totalAfterThis = order.receivedQty + finalReceivedQty;
-            if (totalAfterThis > order.orderedQty) {
-                const previousSurplus = Math.max(0, order.receivedQty - order.orderedQty);
-                const newTotalSurplus = Math.max(0, totalAfterThis - order.orderedQty);
-                const surplusFromThisBatch = newTotalSurplus - previousSurplus;
-
-                if (surplusFromThisBatch > 0) {
-                    await SurplusLedger.create([{
-                        lotNumber: baseBatchId, 
-                        vendorName: order.vendor_id?.name || "PO Vendor",
-                        itemId: order.item_id,
-                        itemName: order.itemName,
-                        itemType: order.itemType,
-                        orderedQty: order.orderedQty,
-                        receivedQty: finalReceivedQty,
-                        surplusAdded: surplusFromThisBatch
-                    }], { session });
-                }
-            }
-        }
-
-        // --- UPDATE INVENTORY ---
-        if (batchesToCreate.length > 0 && !isHighRejection) {
-            if (order.itemType === 'Raw Material') {
-                await Material.findByIdAndUpdate(order.item_id, {
+            // Inventory Update
+            const batchesToCreate = [{ lotNumber: baseBatchId, qty: stockToAdd, addedAt: new Date() }];
+            if (currentItem.itemType === 'Raw Material') {
+                await Material.findByIdAndUpdate(currentItem.item_id, {
                     $inc: { 'stock.current': stockToAdd },
                     $push: { 'stock.batches': { $each: batchesToCreate } }
                 }, { session });
             } else {
-                await Product.findByIdAndUpdate(order.item_id, {
+                await Product.findByIdAndUpdate(currentItem.item_id, {
                     $inc: { 'stock.warehouse': stockToAdd },
                     $push: { 'stock.batches': { $each: batchesToCreate } }
                 }, { session });
             }
+
+            // Update Item Status
+            currentItem.receivedQty += finalReceivedQty;
+            if (currentItem.receivedQty >= currentItem.orderedQty) currentItem.status = 'Completed';
+            else currentItem.status = 'Partial';
         }
 
-        // 6. Update PO Status
-        if (!isHighRejection) {
-            order.receivedQty += finalReceivedQty; 
-            if (order.receivedQty >= order.orderedQty) finalStatus = 'Completed';
-            if (order.status !== 'QC_Review') order.status = finalStatus;
-        }
-
-        // 🟢 7. LOG HISTORY WITH FINANCIALS
-        order.history.push({
+        // 6. LOG HISTORY TO THE SPECIFIC ITEM
+        if (!currentItem.history) currentItem.history = [];
+        currentItem.history.push({
             date: new Date(),
             qty: finalReceivedQty,
             rejected: Number(rejectedQty) || 0,
@@ -300,16 +268,19 @@ exports.receiveOrder = async (req, res) => {
             status: historyStatus,
             lotNumber: baseBatchId,
             breakdown: breakdown,
-            // Track specific financials used for this specific lot
             discountPercent: discRate,
             gstPercent: taxRate,
             totalBatchValue: batchFinalTotal
         });
 
+        // 7. Overall PO Status
+        const allCompleted = order.items.every(i => i.status === 'Completed');
+        if (allCompleted) order.status = 'Completed';
+        else if (order.status !== 'QC_Review') order.status = 'Partial';
+
         await order.save({ session });
         await session.commitTransaction();
-
-        res.json({ success: true, msg: responseMsg, finalAmount: batchFinalTotal });
+        res.json({ success: true, msg: "Receipt Processed Successfully", finalAmount: batchFinalTotal });
 
     } catch (error) {
         await session.abortTransaction();
@@ -324,9 +295,9 @@ exports.receiveOrder = async (req, res) => {
 
 exports.processPurchaseQCDecision = async (req, res) => {
     try {
-        const { orderId, decision, adminNotes } = req.body; 
+        // 🎯 itemId is required to know which product in the array to approve/reject
+        const { orderId, itemId, decision, adminNotes } = req.body; 
         
-        // 🟢 Ensure models are available locally to prevent "not defined" errors
         const Vendor = require('../models/Vendor');
         const Material = require('../models/Material');
         const Product = require('../models/Product');
@@ -334,13 +305,17 @@ exports.processPurchaseQCDecision = async (req, res) => {
         const order = await PurchaseOrder.findById(orderId);
         if (!order) return res.status(404).json({ msg: 'Purchase Order not found' });
 
-        // Get the most recent history entry that was held
-        const lastLog = order.history[order.history.length - 1];
-        if (!lastLog) return res.status(400).json({ msg: 'No QC history found for this order.' });
+        // 🎯 Find the specific item being reviewed in the multi-product array
+        const itemIndex = order.items.findIndex(i => i.item_id.toString() === itemId.toString());
+        if (itemIndex === -1) return res.status(404).json({ msg: 'Item not found in this PO' });
+        
+        const item = order.items[itemIndex];
+        const lastLog = item.history[item.history.length - 1];
+        
+        if (!lastLog) return res.status(400).json({ msg: 'No QC history found for this item.' });
 
         if (decision === 'approve') {
             // --- ACTION: ACCEPT BATCH ---
-            // Calculate accepted qty (Received - Rejected)
             const stockToAdd = lastLog.qty - (lastLog.rejected || 0);
 
             if (stockToAdd > 0) {
@@ -350,41 +325,43 @@ exports.processPurchaseQCDecision = async (req, res) => {
                     addedAt: new Date()
                 };
 
-                // Update physical stock
-                if (order.itemType === 'Raw Material') {
-                    await Material.findByIdAndUpdate(order.item_id, {
+                // Update physical stock based on Item Type
+                if (item.itemType === 'Raw Material') {
+                    await Material.findByIdAndUpdate(item.item_id, {
                         $inc: { 'stock.current': stockToAdd },
                         $push: { 'stock.batches': batchEntry }
                     });
                 } else {
-                    await Product.findByIdAndUpdate(order.item_id, {
+                    await Product.findByIdAndUpdate(item.item_id, {
                         $inc: { 'stock.warehouse': stockToAdd },
                         $push: { 'stock.batches': batchEntry }
                     });
                 }
 
                 // 🟢 Update Vendor Balance officially
-                // This uses the total value calculated during the initial intake
                 const batchValue = lastLog.totalBatchValue || 0;
                 await Vendor.findByIdAndUpdate(order.vendor_id, { 
                     $inc: { balance: batchValue } 
                 });
             }
 
-            // Update PO level totals
-            order.receivedQty += lastLog.qty;
-            order.status = (order.receivedQty >= order.orderedQty) ? 'Completed' : 'Partial';
+            // Update item-level totals and status
+            item.receivedQty += lastLog.qty;
+            item.status = (item.receivedQty >= item.orderedQty) ? 'Completed' : 'Partial';
             lastLog.status = 'Admin Approved';
             
         } else {
             // --- ACTION: SCRAP/REJECT ---
-            // PO stays open so the user can try to receive the correct stock again
-            order.status = 'Partial'; 
+            item.status = 'Rejected'; 
             lastLog.status = 'Rejected by Admin';
         }
 
         // Log the admin decision in the history details
         lastLog.adminNotes = adminNotes;
+
+        // 🎯 Check if all items in the PO are finished to close the overall PO status
+        const allFinished = order.items.every(i => ['Completed', 'Rejected'].includes(i.status));
+        order.status = allFinished ? 'Completed' : 'Partial';
         
         await order.save();
         res.json({ 

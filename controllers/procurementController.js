@@ -8,46 +8,64 @@ const SurplusLedger = require('../models/SurplusLedger');
 // @desc Process Purchase (PO Generation - Standard)
 exports.createPurchase = async (req, res) => {
     try {
-        const { vendor, itemId, itemType, qty, unitPrice, discountPercent, gstPercent } = req.body;
-        
-        // Calculation Logic
-        const gross = Number(qty) * Number(unitPrice);
-        const discountAmount = gross * (Number(discountPercent || 0) / 100);
-        const taxable = gross - discountAmount;
-        const totalAmount = taxable + (taxable * (Number(gstPercent || 0) / 100));
-        
-        let itemName = 'Unknown Item';
-        let fetchedItem = null;
+        const { vendor, items, discountPercent, gstPercent } = req.body;
 
-        if (itemType === 'Raw Material') {
-            fetchedItem = await Material.findById(itemId);
-            if (fetchedItem) itemName = fetchedItem.name;
-        } 
-        else if (itemType === 'Finished Good') {
-            fetchedItem = await Product.findById(itemId);
-            if (fetchedItem) itemName = fetchedItem.name; 
+        if (!items || !Array.isArray(items)) {
+            return res.status(400).json({ msg: "Items array is required" });
         }
 
-        if (!fetchedItem) return res.status(404).json({ msg: 'Item not found' });
+        let calculatedItems = [];
+        let subtotalGross = 0;
+
+        for (const item of items) {
+            // 🎯 Ensure we use the exact keys sent by frontend
+            const { itemId, itemType, qty, unitPrice } = item;
+            let fetchedItem = null;
+
+            // 🟢 Handle potential casing or spacing differences
+            const normalizedType = itemType ? itemType.trim() : "";
+
+            if (normalizedType === 'Raw Material') {
+                fetchedItem = await Material.findById(itemId);
+            } else if (normalizedType === 'Finished Good') {
+                fetchedItem = await Product.findById(itemId);
+            }
+
+            if (!fetchedItem) {
+                // 🎯 This tells you EXACTLY what the backend received
+                return res.status(404).json({ 
+                    msg: `Item not found. ID: ${itemId} | Type Received: "${itemType}"` 
+                });
+            }
+
+            subtotalGross += Number(qty) * Number(unitPrice);
+            calculatedItems.push({
+                item_id: itemId,
+                itemName: fetchedItem.name,
+                itemType: normalizedType,
+                orderedQty: Number(qty),
+                receivedQty: 0,
+                unitPrice: Number(unitPrice),
+                status: 'Pending'
+            });
+        }
+
+        const totalAmount = (subtotalGross - (subtotalGross * (Number(discountPercent || 0) / 100))) * (1 + (Number(gstPercent || 18) / 100));
 
         const newPO = await PurchaseOrder.create({
-            item_id: itemId,
             vendor_id: vendor,
-            itemName: itemName, 
-            itemType: itemType,
-            orderedQty: Number(qty),
-            receivedQty: 0,
-            unitPrice: Number(unitPrice),
-            discountPercent: Number(discountPercent || 0), // Save original discount
-            gstPercent: Number(gstPercent || 0),           // Save original GST
-            totalAmount: totalAmount,                      // Final Calculated Total
-            status: 'Pending'
+            items: calculatedItems,
+            discountPercent: Number(discountPercent),
+            gstPercent: Number(gstPercent),
+            totalAmount: totalAmount,
+            status: 'Pending',
+            orderDate: new Date()
         });
 
-        res.status(201).json({ success: true, msg: `Purchase Order Created.`, order: newPO });
+        res.status(201).json({ success: true, msg: "PO Created!", order: newPO });
 
     } catch (error) {
-        console.error("PO Error:", error); 
+        console.error("Purchase Error:", error);
         res.status(500).json({ msg: error.message });
     }
 };
@@ -58,32 +76,24 @@ exports.createDirectEntry = async (req, res) => {
     const session = await require('mongoose').startSession();
     session.startTransaction();
     try {
-        const { vendorId, items } = req.body; 
-        const createdEntries = [];
-        let grandTotal = 0;
-
-        const vendorDoc = await Vendor.findById(vendorId).session(session);
-        const vendorName = vendorDoc ? vendorDoc.name : "Unknown Vendor";
+        const { vendorId, items, discountPercent, gstPercent } = req.body; 
+        let grandTotalGross = 0;
+        let calculatedItems = [];
 
         for (const item of items) {
-            // 🟢 Robust calculation for Direct Entry row
             const calculatedQty = (Number(item.breakdown?.noOfBoxes || 0) * Number(item.breakdown?.qtyPerBox || 0)) + Number(item.breakdown?.looseQty || 0);
             const finalQty = calculatedQty > 0 ? calculatedQty : (Number(item.qty) || 0);
         
-            // 🛑 Skip if invalid to prevent NaN ledger entries
             if (finalQty <= 0) continue; 
         
-            const lineTotal = Number(item.totalAmount) || (finalQty * Number(item.rate || 0));
-            grandTotal += lineTotal;
+            const lineGross = finalQty * Number(item.rate || 0);
+            grandTotalGross += lineGross;
+
             let itemName = "Unknown";
-            
-            const baseBatch = item.batch && item.batch.trim() !== "" 
-                ? item.batch 
-                : `DIR-${Date.now()}-${Math.floor(Math.random()*1000)}`;
-        
+            const baseBatch = item.batch || `DIR-${Date.now()}-${Math.floor(Math.random()*1000)}`;
             const batchesToCreate = [];
         
-            // 🟢 Box + Loose Lot Splitting
+            // Box + Loose Lot Splitting
             if (item.breakdown?.noOfBoxes > 0) {
                 batchesToCreate.push({
                     lotNumber: `${baseBatch}-BOX`,
@@ -93,7 +103,6 @@ exports.createDirectEntry = async (req, res) => {
                     addedAt: new Date()
                 });
             }
-        
             if (item.breakdown?.looseQty > 0) {
                 batchesToCreate.push({
                     lotNumber: `${baseBatch}-LOOSE`,
@@ -102,12 +111,11 @@ exports.createDirectEntry = async (req, res) => {
                     addedAt: new Date()
                 });
             }
-        
             if (batchesToCreate.length === 0) {
                 batchesToCreate.push({ lotNumber: baseBatch, qty: finalQty, addedAt: new Date() });
             }
         
-            // Update Inventory
+            // Update Inventory logic
             if (item.itemType === 'Raw Material') {
                 const mat = await Material.findById(item.itemId).session(session);
                 if (mat) {
@@ -128,34 +136,50 @@ exports.createDirectEntry = async (req, res) => {
                 }
             }
         
-            const entry = await PurchaseOrder.create([{
+            // Build the item object for the PO array
+            calculatedItems.push({
                 item_id: item.itemId,
-                vendor_id: vendorId,
                 itemName: itemName,
                 itemType: item.itemType,
                 orderedQty: finalQty,
-                receivedQty: finalQty,
+                receivedQty: finalQty, // Direct entry is immediately received
                 unitPrice: Number(item.rate),
-                totalAmount: lineTotal,
-                isDirectEntry: true,
                 status: 'Completed',
-                batchNumber: baseBatch,
-                breakdown: item.breakdown
-            }], { session });
-            
-            createdEntries.push(entry[0]);
+                history: [{
+                    date: new Date(),
+                    qty: finalQty,
+                    mode: 'direct',
+                    receivedBy: 'System (Direct)',
+                    lotNumber: baseBatch,
+                    status: 'Received',
+                    breakdown: item.breakdown
+                }]
+            });
         }
 
-        // Update Vendor Balance
+        // Final Financial Calculations
+        const discAmt = grandTotalGross * (Number(discountPercent || 0) / 100);
+        const taxable = grandTotalGross - discAmt;
+        const finalTotal = taxable + (taxable * (Number(gstPercent || 18) / 100));
+
+        const entry = await PurchaseOrder.create([{
+            vendor_id: vendorId,
+            items: calculatedItems,
+            discountPercent: Number(discountPercent || 0),
+            gstPercent: Number(gstPercent || 18),
+            totalAmount: finalTotal,
+            isDirectEntry: true,
+            status: 'Completed'
+        }], { session });
+
         if (vendorId) {
-            await Vendor.findByIdAndUpdate(vendorId, { $inc: { balance: grandTotal } }).session(session);
+            await Vendor.findByIdAndUpdate(vendorId, { $inc: { balance: finalTotal } }).session(session);
         }
 
         await session.commitTransaction();
-        res.status(201).json({ success: true, msg: "Stock Added with Box/Loose breakdown!", entries: createdEntries });
+        res.status(201).json({ success: true, msg: "Stock Added via Direct Entry!", entry: entry[0] });
     } catch (error) {
         await session.abortTransaction();
-        console.error("Direct Entry Error:", error);
         res.status(500).json({ msg: error.message });
     } finally {
         session.endSession();
@@ -189,31 +213,34 @@ exports.createTradingPO = async (req, res) => {
         if (!job) return res.status(404).json({ msg: "Request not found" });
 
         const validItemName = job.productId ? job.productId.name : "Unknown Product";
+        const totalAmount = job.totalQty * costPerUnit;
 
         const po = await PurchaseOrder.create({
-            po_id: `PO-TR-${Math.floor(1000 + Math.random() * 9000)}`,
             vendor_id: vendorId,
-            item_id: job.productId._id, 
-            itemName: validItemName, 
-            itemType: 'Finished Good',  
-            orderedQty: job.totalQty,
-            receivedQty: 0,
-            unitCost: costPerUnit,
-            totalAmount: job.totalQty * costPerUnit,
+            items: [{
+                item_id: job.productId._id, 
+                itemName: validItemName, 
+                itemType: 'Finished Good',  
+                orderedQty: job.totalQty,
+                receivedQty: 0,
+                unitPrice: costPerUnit,
+                status: 'Pending'
+            }],
+            totalAmount: totalAmount,
             status: 'Pending',
-            expectedDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) 
+            orderDate: new Date()
         });
 
+        // Job Card updates
         job.currentStep = 'PO_Raised';
         job.status = 'In_Progress';
         job.history.push({ step: 'PO Created', status: 'PO_Raised', timestamp: new Date() });
         await job.save();
 
-        await Vendor.findByIdAndUpdate(vendorId, { $inc: { balance: (job.totalQty * costPerUnit) } });
+        await Vendor.findByIdAndUpdate(vendorId, { $inc: { balance: totalAmount } });
 
-        res.json({ success: true, msg: "Purchase Order Created!", po });
+        res.json({ success: true, msg: "Trading PO Created!", po });
     } catch (error) {
-        console.error(error);
         res.status(500).json({ msg: error.message });
     }
 };
