@@ -162,13 +162,13 @@ exports.issueMaterial = async (req, res) => {
   }
 };
 
+// 🟢 UPDATED: dispatchJob to save remarks
 exports.dispatchJob = async (req, res) => {
   try {
-    const { jobId, actualQty, wastage } = req.body;
+    const { jobId, actualQty, wastage, remarks } = req.body; // 🟢 Added remarks
     const job = await JobCard.findOne({ jobId: jobId });
     if (!job) return res.status(404).json({ msg: "Job not found" });
 
-    // 🟢 FIX: Ensure values are treated as numbers and default to 0
     const qtyProduced = Number(actualQty) || 0;
     const qtyWasted = Number(wastage) || 0;
 
@@ -185,12 +185,67 @@ exports.dispatchJob = async (req, res) => {
     job.timeline.push({
       stage: 'Vendor Dispatch',
       action: `Dispatched to Factory`,
-      details: `Vendor reported ${qtyProduced} pcs dispatched. Wastage: ${qtyWasted}kg.`,
+      details: `Vendor reported ${qtyProduced} pcs dispatched.`,
+      remarks: remarks || "", // 🟢 Save remarks here
       performedBy: req.user.name
+    });
+
+    // 🟢 Also add to history for table tracking
+    job.history.push({
+      step: 'Vendor Dispatch',
+      status: 'Dispatched',
+      remarks: remarks || "",
+      timestamp: new Date()
     });
 
     await job.save();
     res.json({ success: true, msg: "Goods dispatched successfully!" });
+  } catch (error) {
+    res.status(500).json({ msg: error.message });
+  }
+};
+
+// 🟢 UPDATED: updateJobStage to save remarks
+exports.updateJobStage = async (req, res) => {
+  try {
+    const { jobId, stageResult, remarks } = req.body; // 🟢 Capture remarks from frontend
+    const job = await JobCard.findOne({ jobId });
+    if (!job) return res.status(404).json({ msg: "Job card not found" });
+
+    // 1. Handle Transitions (Logic remains the same)
+    if (stageResult === "Cutting_Started") job.currentStep = "Cutting_Started";
+    else if (stageResult === "Cutting_Completed") job.currentStep = "Stitching_Pending"; 
+    else if (stageResult === "Sewing_Started") job.currentStep = "Sewing_Started";
+    else if (stageResult === "Stitching_Completed") job.currentStep = "Packaging_Pending";
+    else if (stageResult === "Packaging_Started") job.currentStep = "Packaging_Started";
+    else if (stageResult === "Packaging_Completed") {
+      job.currentStep = "QC_Pending"; 
+      job.status = "QC_Pending"; 
+    }
+
+    // 2. 🟢 Save to Timeline
+    job.timeline.push({
+        stage: job.currentStep,
+        action: stageResult.replace("_", " "),
+        remarks: remarks || "", // 🟢 Save remarks
+        performedBy: req.user.name,
+        timestamp: new Date()
+    });
+
+    // 3. 🟢 Save to History (This is what shows in your "Process Remarks" column)
+    job.history.push({
+      step: stageResult.replace("_", " "),
+      status: job.currentStep,
+      remarks: remarks || "", // 🟢 Save remarks
+      timestamp: new Date()
+    });
+
+    await job.save();
+    res.json({ 
+      success: true, 
+      msg: `Stage updated to ${job.currentStep}`, 
+      nextStep: job.currentStep 
+    });
   } catch (error) {
     res.status(500).json({ msg: error.message });
   }

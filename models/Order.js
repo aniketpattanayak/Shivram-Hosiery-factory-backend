@@ -9,7 +9,7 @@ const OrderSchema = new mongoose.Schema({
   // 🟢 NEW: Advance Payment Fields
   advanceReceived: { type: Boolean, default: false },
   advanceAmount: { type: Number, default: 0 },
-
+  remarks: { type: String, default: "" },
   items: [
     {
       product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
@@ -27,6 +27,11 @@ const OrderSchema = new mongoose.Schema({
     }
   ],
 
+  billToAddress: String,
+  shippingAddress: String,
+  contactPerson: String,
+  billingContact: String,
+  paymentTerms: { type: String, default: '30 Days' },
   // Order Total
   grandTotal: { type: Number, default: 0 },
 

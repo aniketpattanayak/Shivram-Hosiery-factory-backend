@@ -8,7 +8,7 @@ const {
   getClients, createClient, updateClient,
   createQuote, getQuotes, 
   // 🟢 NEW: Import the single quote function
-  getSingleQuotation 
+  getSingleQuotation ,getSingleClient
 } = require('../controllers/salesController');
 
 // ==========================
@@ -18,6 +18,7 @@ router.post('/quotes', auth, createQuote);
 router.get('/quotes', auth, getQuotes);
 // 🟢 NEW ROUTE: Fixes "Error fetching quotation"
 router.get('/quotes/:id', auth, getSingleQuotation);
+router.get('/clients/:id', auth, getSingleClient);
 
 // ==========================
 // 2. ORDERS

@@ -135,6 +135,7 @@ const JobCardSchema = new mongoose.Schema({
       action: String,
       vendorName: String,
       details: String,
+      remarks: String,
       timestamp: { type: Date, default: Date.now },
       performedBy: String
     }
@@ -143,6 +144,7 @@ const JobCardSchema = new mongoose.Schema({
   history: [{
     step: String,
     status: String,
+    remarks: String,
     timestamp: { type: Date, default: Date.now }
   }]
 }, { timestamps: true });

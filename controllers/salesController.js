@@ -137,15 +137,7 @@ exports.getSingleQuotation = async (req, res) => {
   }
 };
 
-// ==========================================
-// 2. SALES ORDER MANAGEMENT (🟢 FIXED CAST ERROR)
-// ==========================================
 
-// ... existing imports ...
-
-// ==========================================
-// 2. SALES ORDER MANAGEMENT (🟢 UPDATED: PRIORITY DISPLACEMENT ENGINE)
-// ==========================================
 
 exports.createOrder = async (req, res) => {
   const session = await mongoose.startSession();
@@ -154,17 +146,36 @@ exports.createOrder = async (req, res) => {
   try {
     const { 
         customerName, customerId, items, deliveryDate, 
-        advanceReceived, advanceAmount 
+        advanceReceived, advanceAmount,
+        // 🟢 Destructure new commercial fields
+        billToAddress, shippingAddress, contactPerson, billingContact, paymentTerms, remarks, 
     } = req.body;
     
-    // 1. Resolve Customer Identity & Tier
-    let clientDoc = await Client.findById(customerId).session(session);
+    let finalCustomerId = customerId;
+
+    // 🟢 NEW: Logic to create a new Client if they don't exist in Master
+    if (!finalCustomerId || finalCustomerId === "") {
+        const newClient = await Client.create([{
+            name: customerName,
+            address: shippingAddress,
+            billToAddress: billToAddress,
+            contactPerson: contactPerson,
+            billingContact: billingContact,
+            paymentTerms: paymentTerms || '30 Days',
+            status: 'Customer',
+            leadType: 'Silver' // Default tier for new entries
+        }], { session });
+        finalCustomerId = newClient[0]._id;
+    }
+
+    // 1. Resolve Customer Tier for Priority
+    let clientDoc = await Client.findById(finalCustomerId).session(session);
     let mappedPriority = 'Low';
     if (clientDoc?.leadType === 'Diamond') mappedPriority = 'High';
     else if (clientDoc?.leadType === 'Gold') mappedPriority = 'Medium';
     else mappedPriority = 'Low';
 
-    // 2. Map Items and Save the New Order (As draft for now)
+    // 2. Map Items
     const processedItems = items.map(item => ({
         product: item.productId,
         productName: item.productName,
@@ -174,60 +185,60 @@ exports.createOrder = async (req, res) => {
         unitPrice: item.unitPrice || 0
     }));
 
+    // 🟢 Updated Order creation with Commercial fields
     const newOrder = new Order({
       orderId: `ORD-2026-${Math.floor(1000 + Math.random() * 9000)}`,
       customerName,
-      clientId: customerId, 
+      clientId: finalCustomerId, 
+      billToAddress,
+      shippingAddress,
+      contactPerson,
+      billingContact,
+      paymentTerms,
       items: processedItems,
       deliveryDate,
       priority: mappedPriority, 
-      status: 'Production_Queued'
+      status: 'Production_Queued',
+      advanceReceived,
+      remarks,
+      advanceAmount: Number(advanceAmount) || 0
     });
 
-    // CRITICAL: Save and wait to ensure newOrder._id is ready for logic
     await newOrder.save({ session });
 
-    // 3. 🟢 GLOBAL WATERFALL RE-ALLOCATION
-    // We check every product involved in the order to re-rank the whole system
+    // 3. 🟢 GLOBAL WATERFALL RE-ALLOCATION (Keep your existing logic here)
     const uniqueProductNames = [...new Set(items.map(i => i.productName))];
-
     for (const pName of uniqueProductNames) {
       const product = await Product.findOne({ name: pName }).session(session);
       if (!product) continue;
 
-      // Find ALL pending orders waiting for this specific product
       const allPending = await Order.find({ 
         'items.productName': pName, 
         status: { $in: ['Production_Queued', 'Ready_Dispatch', 'Partially_Dispatched'] } 
       }).session(session);
 
-      // STEP A: Release all 'Secured' stock into the temporary calculation pool
       let totalPhysicalPool = product.stock.warehouse || 0;
       allPending.forEach(ord => {
         const target = ord.items?.find(i => i.productName === pName);
         if (target) {
             totalPhysicalPool += (target.qtyAllocated || 0);
-            target.qtyAllocated = 0; // Release for re-allocation
+            target.qtyAllocated = 0; 
         }
       });
 
-      // STEP B: Sort by Tier (Diamond > Gold > Silver) then by Oldest Date (FIFO)
       const weightMap = { 'High': 3, 'Medium': 2, 'Low': 1 };
       allPending.sort((a, b) => {
         const weightA = weightMap[a.priority] || 0;
         const weightB = weightMap[b.priority] || 0;
         if (weightB !== weightA) return weightB - weightA;
-        return new Date(a.createdAt) - new Date(b.createdAt); // Earliest Date first
+        return new Date(a.createdAt) - new Date(b.createdAt);
       });
 
-      // STEP C: Distribute the Physical Pool (e.g., your 1,121 PCS)
       let remainingStock = totalPhysicalPool;
       for (const ord of allPending) {
         const itemInOrd = ord.items?.find(i => i.productName === pName);
         if (!itemInOrd) continue;
-
         const needed = (itemInOrd.qtyOrdered || 0) - (itemInOrd.qtyDispatched || 0);
-
         if (remainingStock > 0) {
           const allocation = Math.min(needed, remainingStock);
           itemInOrd.qtyAllocated = allocation;
@@ -237,26 +248,16 @@ exports.createOrder = async (req, res) => {
           itemInOrd.qtyAllocated = 0;
           itemInOrd.qtyToProduce = needed;
         }
-
-        // Update Order Status based on allocation
-        const isFullySecured = ord.items?.every(i => 
-          (i.qtyAllocated || 0) >= ((i.qtyOrdered || 0) - (i.qtyDispatched || 0))
-        );
+        const isFullySecured = ord.items?.every(i => (i.qtyAllocated || 0) >= ((i.qtyOrdered || 0) - (i.qtyDispatched || 0)));
         ord.status = isFullySecured ? 'Ready_Dispatch' : 'Production_Queued';
         await ord.save({ session });
       }
 
-      // Update actual product warehouse stock with unallocated remainder
       product.stock.warehouse = Math.max(0, remainingStock); 
       await product.save({ session });
 
-      // 4. SYNC PRODUCTION PLANS
-      // Clear old pending plans and insert fresh ones for everyone affected
       const affectedOrderIds = allPending.map(o => o._id).filter(id => id != null);
-      await ProductionPlan.deleteMany({ 
-        orderId: { $in: affectedOrderIds }, 
-        status: 'Pending Strategy' 
-      }).session(session);
+      await ProductionPlan.deleteMany({ orderId: { $in: affectedOrderIds }, status: 'Pending Strategy' }).session(session);
 
       const plansToInsert = [];
       for (const ord of allPending) {
@@ -312,6 +313,34 @@ exports.getLeads = async (req, res) => {
   }
 };
 
+
+// @desc    Get Single Client by ID
+// @route   GET /api/sales/clients/:id
+exports.getSingleClient = async (req, res) => {
+  try {
+    // We use Client.findById to fetch the specific document
+    const client = await Client.findById(req.params.id);
+    
+    if (!client) {
+      return res.status(404).json({ msg: "Client not found" });
+    }
+
+    // Security Check: Salesman can only fetch their own clients
+    if ((req.user.role === 'Sales Man' || req.user.role === 'Salesman') && 
+        client.salesPerson !== req.user.name) {
+      return res.status(403).json({ msg: "Access Denied: You do not own this client record" });
+    }
+    
+    res.json(client);
+  } catch (error) {
+    console.error("Get Single Client Error:", error.message);
+    // If the ID is not a valid MongoDB ObjectId, return 404 instead of 500
+    if (error.kind === 'ObjectId') {
+      return res.status(404).json({ msg: "Client not found" });
+    }
+    res.status(500).send("Server Error");
+  }
+};
 exports.createLead = async (req, res) => {
   try {
     // 1. Maintain your Lead ID generation logic

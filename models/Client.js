@@ -11,7 +11,7 @@ const ClientSchema = new mongoose.Schema({
   contactPerson: { type: String },
   contactNumber: { type: String },
   email: { type: String },
-
+  remarks: { type: String, default: "" },
   // Commercial Terms
   paymentTerms: { type: String }, // e.g., "30 Days"
   creditLimit: { type: Number, default: 0 }, // Max credit allowed

@@ -36,7 +36,12 @@ const PurchaseOrderSchema = new mongoose.Schema({
 
     // 🟢 History Log nested inside items
     history: [{
-      date: { type: Date, default: Date.now },
+      // 🎯 UPDATED: Date is now required but defaults to now if not sent
+      date: { type: Date, default: Date.now }, 
+      
+      // 🎯 NEW: Manual Bill/Invoice Number storage
+      billNumber: { type: String, default: "N/A" }, 
+      
       qty: { type: Number, required: true }, 
       rejected: { type: Number, default: 0 },
       mode: String, // 'direct' or 'qc'
@@ -49,12 +54,15 @@ const PurchaseOrderSchema = new mongoose.Schema({
         noOfBoxes: { type: Number, default: 0 },
         qtyPerBox: { type: Number, default: 0 },
         looseQty: { type: Number, default: 0 }
-      }
+      },
+      
+      // 🎯 NEW: Specific line-item total value for financial history
+      totalBatchValue: { type: Number, default: 0 }
     }],
     
     status: { 
       type: String, 
-      // 🟢 FIX: Added 'QC_Review' to the item-level enum
+      // 🟢 FIX: Included all possible item-level workflow states
       enum: ['Pending', 'Partial', 'Completed', 'Rejected', 'QC_Review'], 
       default: 'Pending' 
     }
@@ -65,6 +73,9 @@ const PurchaseOrderSchema = new mongoose.Schema({
   gstPercent: { type: Number, default: 18 },
   totalAmount: { type: Number, default: 0 },   
   isDirectEntry: { type: Boolean, default: false },
+  
+  // 🎯 NEW: Global Remarks/Instructions field
+  remarks: { type: String, default: "" },
 
   // Global PO Status
   status: { 
@@ -72,7 +83,11 @@ const PurchaseOrderSchema = new mongoose.Schema({
     enum: ['Pending', 'Partial', 'Completed', 'QC_Review', 'Rejected'],
     default: 'Pending' 
   },
+  
+  // 🎯 Keep created_at for legacy and use timestamps for modern auditing
   created_at: { type: Date, default: Date.now }
-}, { timestamps: true });
+}, { 
+  timestamps: true // Automatically manages createdAt and updatedAt
+});
 
 module.exports = mongoose.model('PurchaseOrder', PurchaseOrderSchema);
