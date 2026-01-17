@@ -3,7 +3,89 @@ const Material = require('../models/Material');
 const Product = require('../models/Product');
 const JobCard = require('../models/JobCard');
 const ProductionPlan = require('../models/ProductionPlan');
+const SurplusLedger = require("../models/SurplusLedger");
 
+exports.adjustStockManually = async (req, res) => {
+  try {
+    const { itemId, itemType, adjustmentType, quantity, reason, lotNumber } = req.body;
+    const qtyToAdjust = Number(quantity);
+
+    // 1. Security Check
+    if (req.user.role !== 'Admin') {
+      return res.status(403).json({ msg: "Access denied. Admin only." });
+    }
+
+    const Model = itemType === 'Raw Material' ? Material : Product;
+    const item = await Model.findById(itemId);
+
+    if (!item) return res.status(404).json({ msg: "Item not found" });
+
+    // 🎯 FIX: Finished Goods use 'warehouse', Raw Materials use 'current'
+    const stockField = itemType === 'Raw Material' ? 'current' : 'warehouse';
+
+    if (adjustmentType === 'Deduct') {
+      // Validate against the correct stock field
+      if (item.stock[stockField] < qtyToAdjust) {
+        return res.status(400).json({ msg: `Insufficient ${itemType} stock.` });
+      }
+
+      // 🎯 Target specific lot if provided, otherwise fallback to FIFO
+      const targetLot = item.stock.batches.find(b => b.lotNumber === lotNumber);
+      
+      if (targetLot) {
+        if (targetLot.qty < qtyToAdjust) {
+          return res.status(400).json({ msg: "Not enough stock in this specific lot." });
+        }
+        targetLot.qty -= qtyToAdjust;
+      } else {
+        // Fallback FIFO logic: Sort oldest first and drain batches
+        let remaining = qtyToAdjust;
+        item.stock.batches.sort((a, b) => new Date(a.date || a.addedAt) - new Date(b.date || b.addedAt));
+
+        for (let batch of item.stock.batches) {
+          if (remaining <= 0) break;
+          if (batch.qty <= 0) continue;
+          const deduct = Math.min(batch.qty, remaining);
+          batch.qty -= deduct;
+          remaining -= deduct;
+        }
+      }
+      // Update global stock counter for the specific type
+      item.stock[stockField] -= qtyToAdjust;
+    } else {
+      // 🎯 Add Stock Logic
+      item.stock.batches.push({
+        lotNumber: lotNumber || `ADJ-${Date.now()}`,
+        qty: qtyToAdjust,
+        date: new Date(),
+        addedAt: new Date()
+      });
+      // Update global stock counter for the specific type
+      item.stock[stockField] += qtyToAdjust;
+    }
+
+    await item.save();
+    
+    // 🎯 FIX: Providing all fields required by your strict SurplusLedger Schema
+    await SurplusLedger.create({
+      itemId: itemId,             
+      itemType: itemType,         
+      lotNumber: lotNumber || `ADJ-${Date.now()}`, 
+      orderedQty: qtyToAdjust,    
+      receivedQty: qtyToAdjust,   
+      surplusAdded: 0,            
+      type: adjustmentType === 'Deduct' ? 'Stock_Out' : 'Stock_In',
+      reason: reason || `Manual Admin Adjustment (${adjustmentType})`,
+      adjustedBy: req.user.name,
+      date: new Date()
+    });
+
+    res.json({ success: true, msg: "Stock adjusted!", currentStock: item.stock[stockField] });
+  } catch (error) {
+    console.error("Adjustment Error Detail:", error); 
+    res.status(500).json({ msg: "Server Error: " + error.message });
+  }
+};
 // @desc    Issue Raw Material (Store -> Floor)
 exports.issueMaterial = async (req, res) => {
   const session = await mongoose.startSession();

@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-
+const { protect } = require('../middleware/auth');
 // Import Logic from Inventory Controller
 const { 
   issueMaterial, 
@@ -9,7 +9,8 @@ const {
   createMaterial,
   recalculateAll,
   // 🟢 Ensure this is imported
-  updateMaterial 
+  updateMaterial ,
+  adjustStockManually,
 } = require('../controllers/inventoryController');
 
 // Import Logic from Dispatch Controller
@@ -27,7 +28,8 @@ router.post('/issue-material', issueMaterial);
 
 // 🟢 Route for Editing Material
 router.put('/:id', updateMaterial);
-
+// Add this route with the Admin check
+router.post('/adjust-stock', protect, adjustStockManually);
 router.post('/qc-pass', approveQC);          
 router.post('/recalculate', recalculateAll);
 
