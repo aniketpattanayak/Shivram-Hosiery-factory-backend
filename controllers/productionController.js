@@ -46,18 +46,22 @@ exports.deleteProduct = async (req, res) => {
 
 // @desc    Get Pending Plans 
 // 🟢 UPDATED: Filter out plans that are satisfied by Dispatch
+// backend/controllers/productionController.js
 exports.getPendingPlans = async (req, res) => {
   try {
     const plans = await ProductionPlan.find({ 
-      // Fetch anything not marked strictly 'Completed' or 'Fulfilled_By_Stock'
       status: { $nin: ['Completed', 'Fulfilled_By_Stock'] } 
     })
       .populate('orderId') 
-      .populate('product')
+      .populate({
+          path: 'product',
+          populate: { 
+            path: 'bom.material', // 🟢 CRITICAL: This pulls the Fabric/Thread details
+            model: 'Material' 
+          } 
+      })
       .sort({ createdAt: -1 });
 
-    // Client-side logic will calculate Unplanned, but we can filter here too
-    // Filter: Only send plans where (Total - Planned - Dispatched) > 0
     const activePlans = plans.filter(plan => {
         const total = plan.totalQtyToMake;
         const planned = plan.plannedQty || 0;
@@ -67,7 +71,6 @@ exports.getPendingPlans = async (req, res) => {
 
     res.json(activePlans);
   } catch (error) {
-    console.error("Error fetching pending plans:", error);
     res.status(500).json({ msg: error.message });
   }
 };

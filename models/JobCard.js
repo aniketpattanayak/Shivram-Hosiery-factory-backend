@@ -40,7 +40,9 @@ const JobCardSchema = new mongoose.Schema({
       'Stitching_Pending',   
       'Sewing_Started',      
       'Stitching_Completed', 
-      'Packaging_Pending',   // 🟢 DIRECT LINK: Now follows Stitching_Completed
+      'Stitching_QC_Pending', // 🟢 NEW: 1st Gate (Gatekeeper)
+      'Ready_For_Packaging',  // 🟢 NEW: Post-1st QC Gate
+      'Packaging_Pending',   
       'Packaging_Started', 
       'Packaging_Completed', 
       'QC_Pending',          // 🟢 Final QC Only (Gate 2)

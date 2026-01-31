@@ -7,12 +7,12 @@ const PurchaseOrder = require('../models/PurchaseOrder');
 exports.getPendingQC = async (req, res) => {
   try {
     const jobs = await JobCard.find({ 
-        currentStep: { $in: ['QC_Pending', 'Sewing_Started', 'Cutting_Started', 'Production_Completed'] }, 
+        currentStep: { $in: ['Stitching_QC_Pending', 'QC_Pending'] }, 
         status: { $ne: 'Completed' }
     })
     .populate('productId', 'name sku currentStock') 
     .populate('planId', 'clientName')
-    .sort({ createdAt: -1 });
+    .sort({ updatedAt: -1 });
     
     res.json(jobs);
   } catch (error) {
@@ -24,137 +24,63 @@ exports.getPendingQC = async (req, res) => {
 // @route   POST /api/quality/submit
 exports.submitQC = async (req, res) => {
   try {
-    // 🟢 Capture sampleSource from frontend ('Main' or 'Loose')
-    const { jobId, sampleSize, qtyRejected, notes, sampleSource } = req.body;
-
+    const { jobId, sampleSize, qtyRejected, notes } = req.body;
     const job = await JobCard.findOne({ jobId });
     if (!job) return res.status(404).json({ msg: 'Job not found' });
 
-    // Ensure physical receipt before QC
-    if (job.logisticsStatus === 'In_Transit') {
-      return res.status(400).json({ 
-        msg: 'Physical Receipt Required! You must receive these goods on the Shop Floor before performing QC.' 
-      });
-    }
-
     const product = await Product.findById(job.productId);
-    if (!product) return res.status(404).json({ msg: 'Product not found' });
-
-    const totalBatchQty = job.totalQty || 0; 
     const rejected = Number(qtyRejected) || 0;
-    const passedQty = Math.max(0, totalBatchQty - rejected); 
-    const inspectorName = req.user ? req.user.name : "Unknown Inspector";
+    const passedQty = Math.max(0, job.totalQty - rejected);
 
-    // 🟢 1. CALCULATE REJECTION RATE & TRIGGER HOLD LOGIC
-    const sample = Number(sampleSize) || 1; // Prevent division by zero
-    const rejectionRate = (rejected / sample) * 100;
-    const isHold = rejectionRate >= 20;
+    // 🟢 GATE 1: STITCHING QC Logic
+   // 🟢 UPDATED GATE 1: STITCHING QC Logic with Hold Trigger
+   if (job.currentStep === 'Stitching_QC_Pending') {
+    const rejectionThreshold = 0.20; // 20% limit
+    const currentRejectionRate = rejected / sampleSize;
 
-    // 🟢 2. SOURCE-SPECIFIC REJECTION DEDUCTION (If applicable)
-    if (rejected > 0) {
-        const targetBatch = product.stock.batches.find(b => 
-            sampleSource === 'Loose' 
-            ? (b.lotNumber.includes('LOOSE') && b.jobId === job.jobId) 
-            : (!b.lotNumber.includes('LOOSE') && b.jobId === job.jobId)
-        );
-
-        if (targetBatch) {
-            targetBatch.qty = Math.max(0, targetBatch.qty - rejected);
-            product.stock.warehouse = Math.max(0, product.stock.warehouse - rejected);
-        }
-    }
-
-    // 🟢 3. SAVE QC METADATA (Crucial for Admin Review Page display)
-    job.qcResult = {
-        status: isHold ? 'Held' : 'Passed',
-        sampleSize: Number(sampleSize),
-        rejectedQty: rejected,
-        passedQty: passedQty,
-        notes: notes || "No remarks",
-        inspector: inspectorName,
-        sampleSource: sampleSource,
-        rejectionRate: rejectionRate.toFixed(2), // 🎯 Stored for review
-        timestamp: new Date()
-    };
-
-    // 🟢 4. DIVERSE PATH LOGIC BASED ON THRESHOLD
-    if (isHold) {
+    if (currentRejectionRate >= rejectionThreshold) {
+        // 🛑 TRIGGER ADMIN REVIEW
         job.status = 'QC_HOLD';
-        job.currentStep = 'QC_Review_Needed';
+        job.currentStep = 'Stitching_QC_Pending'; // Keep it here for admin to see context
         
-        if (!job.history) job.history = [];
         job.history.push({ 
-            step: 'Quality Control', 
-            status: 'Held',
-            details: `⚠️ CRITICAL: ${rejectionRate.toFixed(1)}% Rejection. Sent to Admin Review. Source: ${sampleSource}`,
-            timestamp: new Date() 
-        });
-
-        await product.save();
-        await job.save();
-        
-        return res.json({ 
-            success: true, // Use true so the frontend Alert shows correctly
-            hold: true, 
-            msg: `⚠️ High Rejection (${rejectionRate.toFixed(1)}%). Batch moved to Admin Review.` 
-        });
-    }
-
-    // --- Path Logic (Only runs if rejection < 20%) ---
-    const hasPassedAssembly = job.history?.some(h => h.step === 'Assembly QC');
-
-    if (!hasPassedAssembly) {
-        // --- GATE 1: ASSEMBLY QC ---
-        const sfgLotId = `SFG-${job.jobId.split('-').pop()}`;
-        
-        product.stock.semiFinished.push({
-          lotNumber: sfgLotId,
-          qty: Number(passedQty),
-          date: new Date(),
-          jobId: job.jobId
-        });
-
-        job.currentStep = 'Packaging_Pending'; 
-        job.status = 'Ready_For_Packing'; 
-
-        if (!job.history) job.history = [];
-        job.history.push({ 
-            step: 'Assembly QC', 
-            status: `SFG Verified`,
-            details: `Passed Assembly Gate. Moved to Storage. Source: ${sampleSource}`,
+            step: 'Stitching QC', 
+            status: 'QC_HOLD',
+            remarks: notes,
+            details: `🚨 HIGH REJECTION RATE (${(currentRejectionRate * 100).toFixed(2)}%). Sent to Admin for review.`,
             timestamp: new Date() 
         });
     } else {
-        // --- GATE 2: FINAL QC ---
-        product.stock.warehouse += Number(passedQty);
-        product.stock.batches.push({
-            lotNumber: `FG-${job.jobId.split('-').pop()}`, 
-            qty: Number(passedQty),
-            date: new Date(),
-            inspector: inspectorName,
-            sampleSource: sampleSource,
-            jobId: job.jobId
+        // ✅ AUTO-PASS
+        job.currentStep = 'Ready_For_Packaging';
+        job.status = 'Ready_For_Packing';
+        
+        job.history.push({ 
+            step: 'Stitching QC', 
+            status: 'Passed',
+            details: `1st QC Complete. ${passedQty} units moved to Packaging floor.`,
+            timestamp: new Date() 
         });
-
-        product.stock.semiFinished = product.stock.semiFinished.filter(lot => lot.jobId !== job.jobId);
+    }
+}
+    // 🟢 GATE 2: FINAL QC Logic
+    else if (job.currentStep === 'QC_Pending') {
         job.status = 'Completed';
         job.currentStep = 'QC_Completed';
+        product.stock.warehouse += passedQty; // Add to final stock
 
-        if (!job.history) job.history = [];
         job.history.push({ 
-            step: 'Final Quality Control', 
-            status: `Verified (Final)`,
-            details: `Finished Goods moved to Warehouse. Source: ${sampleSource}`,
+            step: 'Final QC', 
+            status: 'Completed',
+            details: `Final QC Passed. ${passedQty} units added to Warehouse.`,
             timestamp: new Date() 
         });
     }
 
     await product.save();
     await job.save();
-
-    res.json({ success: true, msg: `✅ QC Approved! Status: ${job.currentStep}` });
+    res.json({ success: true, msg: "QC Successfully Logged" });
   } catch (error) {
-    console.error("QC Submission Error:", error);
     res.status(500).json({ msg: error.message });
   }
 };
@@ -279,15 +205,38 @@ exports.reviewQC = async (req, res) => {
             timestamp: new Date()
         });
 
-    } else if (decision === 'reject') {
-        // Use existing valid rejection statuses
-        job.status = 'QC_Rejected';
-        job.currentStep = 'Scrapped';
-        
+      } else if (decision === 'rework') {
+        // 🟢 REWORK LOOP LOGIC
+        let returnStage = '';
+        let stageLabel = '';
+
+        if (job.currentStep === 'Stitching_QC_Pending' || job.status === 'QC_HOLD') {
+            // If it failed Stitching QC, send back to Cutting
+            returnStage = 'Cutting_Started';
+            stageLabel = 'Cutting Floor';
+        } else if (job.currentStep === 'QC_Pending') {
+            // If it failed Final QC, send back to Packaging
+            returnStage = 'Packaging_Started';
+            stageLabel = 'Packaging Floor';
+        }
+
+        job.currentStep = returnStage;
+        job.status = 'In_Progress'; // Reset status to active
+
         job.history.push({
             step: 'Admin QC Review',
-            status: 'Rejected',
-            details: `Rejected by Admin ${adminName}. Notes: ${adminNotes}`,
+            status: 'Rework Assigned',
+            remarks: adminNotes, // 🎯 Capturing rework instructions
+            details: `Admin assigned rework. Job moved back to ${stageLabel}.`,
+            timestamp: new Date()
+        });
+
+        // Add to main timeline for visibility on Shop Floor
+        job.timeline.push({
+            stage: 'Rework',
+            action: 'Sent back for Rework',
+            details: `Rework instructions: ${adminNotes}`,
+            performedBy: adminName,
             timestamp: new Date()
         });
     }
