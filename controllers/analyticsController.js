@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 // 🟢 NEW: Import Order model to fetch sales pipeline stats
 const Order = require("../models/Order"); 
 
+
 exports.getFactoryIntelligence = async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
