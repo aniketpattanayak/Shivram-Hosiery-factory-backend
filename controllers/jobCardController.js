@@ -254,6 +254,7 @@ exports.receiveHandshake = async (req, res) => {
   try {
     const { jobId, receivedQty } = req.body;
     const job = await JobCard.findOne({ jobId });
+
     if (!job) return res.status(404).json({ msg: "Job not found" });
 
     job.receivedLogs.push({
@@ -262,16 +263,24 @@ exports.receiveHandshake = async (req, res) => {
       receivedQty: Number(receivedQty),
       receivedBy: req.user.name,
     });
-    job.logisticsStatus = "Received_At_Factory"; // 🔓 The "Gate" is now open
+
+    // 🟢 1. Goods are back, so they are no longer "In_Transit"
+    job.logisticsStatus = "Received_At_Factory"; 
+
+    // 🟢 2. FORCE FLOW: Vendor goods go straight to Gate 1 QC
+    job.currentStep = "Stitching_QC_Pending"; 
+    job.status = "QC_Pending";
 
     job.timeline.push({
       stage: "Logistics",
-      action: "Received",
-      details: `Received ${receivedQty} units at Factory.`,
+      action: "Vendor Handshake",
+      details: `Received ${receivedQty} units. Moved to Stitching QC (Gate 1).`,
       performedBy: req.user.name,
     });
+
     await job.save();
-    res.json({ success: true, msg: "Goods Received" });
+    res.json({ success: true, msg: "Goods Received & Sent to Gate 1 QC" });
+
   } catch (error) {
     res.status(500).json({ msg: error.message });
   }
@@ -391,37 +400,80 @@ exports.updateJobStage = async (req, res) => {
 // ---------------------------------------------------------
 // 🟢 UPDATED: RECEIVE PROCESS WITH SFG & DUAL-QC SUPPORT
 // ---------------------------------------------------------
+// 🟢 UPDATED: RECEIVE PROCESS (Enforces Gate 1 QC)
+// 🟢 UPDATED: RECEIVE PROCESS (With Strict Stitching Start Logic)
+// 🟢 FULLY UPDATED: RECEIVE PROCESS (Handles Cutting -> Stitching -> Vendor/Gate 1 -> Packing)
 exports.receiveProcess = async (req, res) => {
   try {
     const { jobId, nextStage } = req.body;
     const job = await JobCard.findOne({ jobId });
+
     if (!job) return res.status(404).json({ msg: "Job not found" });
 
     let historyLog = { timestamp: new Date(), performedBy: req.user?.name || "Production Mgr" };
 
-    if (job.currentStep === "Cutting_Started") {
+    // --- LOGIC START ---
+    
+    // 1. Cutting Done -> Move to Stitching Pending (Wait for Start)
+    if (job.currentStep === "Cutting_Started" && nextStage === "Stitching_Pending") {
       historyLog.action = "Cutting Completed";
-      historyLog.details = "Panels sent to Stitching.";
+      historyLog.details = "Cutting finished. Job queued for Stitching.";
+      job.currentStep = "Stitching_Pending"; 
     } 
+
+    // 2. Stitching Pending -> Start Stitching
+    else if (job.currentStep === "Stitching_Pending" && nextStage === "Sewing_Started") {
+      historyLog.action = "Stitching Started";
+      historyLog.details = "Production started on Stitching Floor.";
+      job.currentStep = "Sewing_Started"; 
+    }
+
+    // 🟢 3a. Stitching Done (JOB WORK) -> Move to 'In Transit'
+    // This ensures the "Receive from Vendor" button appears on the frontend
+    else if (job.currentStep === "Sewing_Started" && nextStage === "Stitching_Completed") {
+      historyLog.action = "Stitching Sent to Vendor";
+      historyLog.details = "Stitched units sent to Job Worker for finishing/next step.";
+      
+      job.currentStep = "Stitching_Completed"; 
+      job.logisticsStatus = "In_Transit"; // 🚚 CRITICAL: Triggers Handshake Button
+    }
+
+    // 🟢 3b. Stitching Done (IN HOUSE) -> Move to Gate 1 QC
     else if (job.currentStep === "Sewing_Started") {
       historyLog.action = "Stitching Completed";
-      // 🟢 CHANGE: Now bypassing Assembly QC and going to Packaging
-      historyLog.details = "Stitched items sent directly to Packaging Area.";
+      historyLog.details = "Stitched items sent to Gate 1 QC.";
+      
+      // FORCE GATE 1: Do not go to Packaging yet
+      job.currentStep = "Stitching_QC_Pending"; 
+      job.status = "QC_Pending"; 
     } 
-    else if (job.currentStep === "Packaging_Pending") {
+
+    // 4. Gate 1 QC Approved -> Move to Packaging
+    else if (job.currentStep === "Ready_For_Packaging" && nextStage === "Packaging_Started") {
       historyLog.action = "Packaging Started";
+      historyLog.details = "Packing process initiated.";
+      job.currentStep = "Packaging_Started";
     }
+
+    // 5. Packaging Done -> Move to Final QC
+    else if (job.currentStep === "Packaging_Started") {
+      historyLog.action = "Packaging Completed";
+      historyLog.details = "Packed items sent to Final QC.";
+      job.currentStep = "QC_Pending";
+      job.status = "QC_Pending";
+    }
+    
+    // 6. Default Fallback
+    else {
+        job.currentStep = nextStage;
+    }
+
+    // --- LOGIC END ---
 
     if (historyLog.action) job.timeline.push(historyLog);
 
-    // 🟢 Logic: If Stitching is done, automatically skip to Packaging if nextStage was QC
-    job.currentStep = (nextStage === "QC_Pending" && job.currentStep === "Sewing_Started") 
-        ? "Packaging_Pending" 
-        : nextStage;
-
-    job.status = (job.currentStep === "QC_Pending") ? "QC_Pending" : "In_Progress";
-
     await job.save();
     res.json({ success: true, job });
+
   } catch (error) { res.status(500).json({ msg: error.message }); }
 };
